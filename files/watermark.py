@@ -44,7 +44,7 @@ def bootstrap():
     if not VENV_PY.exists():
         print('📦 virtual environment बनवतोय...')
         subprocess.check_call([sys.executable, '-m', 'venv', str(VENV)])
-    marker = VENV / '.deps_ok'
+    marker = VENV / '.deps_ok2'          # नवं नाव: जुने अर्धवट venv आपोआप दुरुस्त होतात
     if not marker.exists():
         py = str(VENV_PY)
         print('📦 packages install करतोय (पहिल्यांदाच, थोडा वेळ लागेल)...')
@@ -52,10 +52,22 @@ def bootstrap():
         for r in REQS:
             if subprocess.call([py, '-m', 'pip', 'install', '-q', r]):
                 print(f'⚠️  {r} install failed')
-        if subprocess.call([py, '-m', 'pip', 'install', '-q', 'tgcrypto']):
-            print('⚠️  tgcrypto install झालं नाही (Python 3.11/3.12 वापरा किंवा '
-                  'Visual C++ Build Tools install करा) — worker ला हे लागतं')
-        marker.write_text('ok')
+        # tgcrypto: compiler नको म्हणून फक्त तयार (wheel) package. Python 3.12/3.13 साठी
+        # मूळ tgcrypto चा Windows wheel नाही → tgcrypto-pyrofork (तोही `import tgcrypto`).
+        crypto_ok = False
+        for pkg in ('tgcrypto', 'tgcrypto-pyrofork'):
+            subprocess.call([py, '-m', 'pip', 'install', '-q', '--only-binary=:all:', pkg],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if subprocess.call([py, '-c', 'import tgcrypto'], stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL) == 0:
+                crypto_ok = True
+                print(f'✅ tgcrypto तयार ({pkg})')
+                break
+        if crypto_ok:
+            marker.write_text('ok')
+        else:
+            print('⚠️  tgcrypto install झालं नाही — worker ला हे लागतं. Python 3.11/3.12 (64-bit) वापरा,'
+                  ' मग `python watermark.py` परत चालवा.')
     sys.exit(subprocess.call([str(VENV_PY), str(SELF)] + sys.argv[1:]))
 
 
@@ -137,6 +149,8 @@ def log(line, src='M'):
 
 # ───────────────────────── helpers ─────────────────────────
 STATE = {'url': '', 'started': time.time()}
+PANEL_TOKENS = {}                  # bot ने दिलेले एकदाचे terminal tokens: token -> expiry
+PANEL_TOKENS_LOCK = threading.Lock()
 W = {'proc': None, 'want': True, 'started': 0.0, 'restarts': 0, 'last_exit': None, 'manual': False}
 
 def save_state():
@@ -386,6 +400,14 @@ def run_command(c):
         if W['want']:
             W['manual'] = True; stop_worker()
         return f'✅ Job-server URL बदलला:\n{a}\n🔁 Worker नव्या URL ने restart होतोय'
+    if t == 'ptoken':                       # bot ने दिलेला एकदाचा terminal token (2 मिनिटं)
+        if re.fullmatch(r'[A-Za-z0-9_-]{20,64}', a):
+            with PANEL_TOKENS_LOCK:
+                now = time.time()
+                for k in [k for k, v in PANEL_TOKENS.items() if v < now]:
+                    del PANEL_TOKENS[k]
+                PANEL_TOKENS[a] = now + 120
+        return ''                           # रिकामा result = bot वर काहीच message नाही
     if t == 'rmgr':
         threading.Thread(target=lambda: (time.sleep(2), restart_manager()), daemon=True).start()
         return '♻️ Manager restart होतोय (1-2 मिनिटांत परत येईल)'
@@ -571,7 +593,7 @@ def restart_manager():
     os._exit(0)
 
 def make_app():
-    from flask import Flask, request, session, jsonify, Response
+    from flask import Flask, request, session, jsonify, Response, abort
     app = Flask(__name__)
     sf = BASE / '.secret'
     if not sf.exists():
@@ -585,13 +607,59 @@ def make_app():
     def ip():
         return request.headers.get('CF-Connecting-IP') or request.remote_addr
 
+    def is_remote():
+        # Cloudflare tunnel वरून आलेल्या requests ना हे headers नेहमी असतात (बाहेरचा माणूस ते काढू शकत नाही)
+        return bool(request.headers.get('Cf-Ray') or request.headers.get('Cf-Connecting-Ip'))
+
+    def session_ok():
+        return bool(session.get('ok')) and time.time() < session.get('exp', float('inf'))
+
     def auth(f):
         @functools.wraps(f)
         def w(*a, **k):
-            if not session.get('ok'):
+            if not session_ok():
                 return jsonify(error='login'), 401
             return f(*a, **k)
         return w
+
+    @app.before_request
+    def gate():
+        if not is_remote() or session_ok():
+            return None                               # PC वरून स्वतः (127.0.0.1) → पूर्वीसारखा password login
+        if request.path == '/' and request.method == 'GET' and request.args.get('k'):
+            return Response(ENTER_PAGE, mimetype='text/html', headers={'Cache-Control': 'no-store'})
+        if request.path == '/enter' and request.method == 'POST':
+            return None
+        abort(404)                                    # internet ला login पान सुद्धा नाही — रिकामा 404
+
+    @app.errorhandler(404)
+    def _nf(e):
+        return '', 404
+
+    @app.post('/enter')
+    def enter():
+        d = request.get_json(silent=True) or {}
+        tok, k, now = str(d.get('k', '')), ip(), time.time()
+        n, t = fails.get(k, (0, 0))
+        if n >= 5 and now - t < 300:
+            return '', 404
+        hit = None
+        with PANEL_TOKENS_LOCK:
+            for t2 in [t2 for t2, v in PANEL_TOKENS.items() if v < now]:
+                del PANEL_TOKENS[t2]
+            for t2 in list(PANEL_TOKENS):
+                if hmac.compare_digest(t2.encode(), tok.encode()):
+                    hit = t2
+            if hit:
+                del PANEL_TOKENS[hit]                 # एकदाच वापरता येतो
+        if not hit:
+            fails[k] = (n + 1, now)
+            time.sleep(1)
+            return '', 404
+        session.clear()
+        session['ok'] = True
+        session['exp'] = now + 7200                   # remote session 2 तास
+        return jsonify(ok=1)
 
     @app.get('/')
     def index():
@@ -914,6 +982,14 @@ def main():
         return print('✅ Auto-start काढला')
     cmd_default()
 
+
+ENTER_PAGE = r'''<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<title>…</title><body style="font:16px system-ui;background:#0f1115;color:#e6e8ee;padding:30px">⏳
+<script>
+const k=new URLSearchParams(location.search).get('k');history.replaceState(null,'','/');
+fetch('/enter',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({k})})
+ .then(r=>r.ok?location.replace('/'):document.body.textContent='✖ Link संपला किंवा आधीच वापरला').catch(()=>document.body.textContent='✖ error');
+</script>'''
 
 PAGE = r'''<!doctype html><html lang="mr"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Worker Panel</title>
