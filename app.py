@@ -15,6 +15,9 @@ Environment variables (Render dashboard → Environment):
   PANEL_PASSWORD      सगळ्या PC च्या web terminal चा password               [required]
   MONGODB_URI         Atlas URI — admin login/lockout restart नंतरही राहतात [strongly recommended]
   KOYEB_URL           default job/poll server URL (नवीन PC साठी)            [optional]
+  SESSION_KEY         Telegram sessions encrypt करणारी Fernet key           [Telegram accounts साठी]
+  TG_API_ID/TG_API_HASH  default api (login वेळी वेगळा देता येतो)          [optional]
+  BW_LIMIT_GB / MAX_ACCOUNTS / MAX_UPLOAD_MB / MAX_MEDIA_MB                  [optional]
   ADMIN_CHAT_ID       (optional) कायमचे admin ids, password शिवाय — रिकामं सोडा
   LOCKOUT_HOURS       4 चुकीच्या प्रयत्नांनंतर block किती तास (default 24, 0 = कायमचं)
   ADMIN_SESSION_DAYS  login किती दिवस टिकतो (default 30, 0 = कधीच संपत नाही)
@@ -25,6 +28,11 @@ import os, re, hmac, html, json, time, base64, struct, hashlib, secrets, threadi
 import urllib.request, urllib.parse
 from pathlib import Path
 from flask import Flask, request, Response, abort, jsonify, has_request_context
+try:
+    import tgweb                                    # Telegram accounts (optional)
+except Exception as _e:                             # pragma: no cover
+    tgweb = None
+    print('tgweb load failed:', _e)
 
 app = Flask(__name__)
 FILES = Path(__file__).parent / 'files'
@@ -50,7 +58,7 @@ if TOTP_ON:
         raise RuntimeError('ADMIN_TOTP_SECRET चुकीचा आहे (base32 अक्षरं A-Z आणि 2-7 हवीत)')
 STEALTH_TRIGGER = os.environ.get('STEALTH_TRIGGER', '').strip()          # असेल तर अनोळखीला उत्तरच नाही
 STEPUP_SECS = int(float(os.environ.get('STEPUP_MINUTES', '10')) * 60)
-SENSITIVE = {'t', 'u', 'ua', 'n', 'ar', 'aa'}                            # यासाठी ताजा 2FA code लागतो
+SENSITIVE = {'t', 'u', 'ua', 'n', 'ar', 'aa', 'tg', 'tr', 'tx'}                            # यासाठी ताजा 2FA code लागतो
 KOYEB_DEFAULT = [os.environ.get('KOYEB_URL', '').rstrip('/')]
 AGENT_MASTER = os.environ.get('AGENT_MASTER') or hashlib.sha256(
     f'agent|{COLAB_SECRET}|{TG_TOKEN}'.encode()).hexdigest()
@@ -163,6 +171,7 @@ def main_kb():
     rows = [[{'text': f"{'🟢' if online(pc) else '🔴'} {pc['name']}", 'callback_data': f'p:{pcid}'}]
             for pcid, pc in sorted(PCS.items(), key=lambda kv: kv[1]['name'])]
     rows.append([{'text': '🌐 सगळ्यांचा Job URL बदला', 'callback_data': 'ua'}])
+    rows.append([{'text': '👤 Telegram Accounts', 'callback_data': 'ta'}])
     rows.append([{'text': '👥 Admins', 'callback_data': 'adm'}])
     rows.append([{'text': '➕ नवा PC install', 'callback_data': 'n'},
                  {'text': '🔄 Refresh', 'callback_data': 'm'}])
@@ -237,6 +246,47 @@ def on_callback(cbid, uid, chat, mid, data):
         ans('🔑 2FA code लागतो')
         tg('sendMessage', chat_id=chat, text='🔑 सुरक्षेसाठी Authenticator app मधला 6 अंकी code पाठवा.\nरद्द: /cancel')
         return
+    if kind == 'ta':
+        ans(); t, kb = ta_view(); show(chat, mid, t, kb); return
+    if kind == 'tb':
+        st = tgweb.bw_status() if TG_ON else {'used': 0, 'limit': 0, 'month': '-'}
+        ans(f"📊 {st['used'] / 1048576:.1f} MB / {st['limit'] / 1073741824:.1f} GB ({st['month']})", True); return
+    if kind == 'tg':
+        if not TG_ON:
+            ans('Telegram accounts बंद आहेत', True); return
+        tok = tgweb.new_token()
+        ans('✅ Link पाठवतोय')
+        send_ephemeral(chat, f"👤 <b>Telegram UI</b>\n{esc(root_url())}/app?k={tok}\n\n"
+                             f"⏱ एकदाच चालतो, 2 मिनिटं. हा message 90 सेकंदांत आपोआप delete होईल.")
+        return
+    if kind in ('tp', 'tc', 'tr', 'tx'):
+        aid = parts[1] if len(parts) > 1 else ''
+        if not TG_ON or not re.fullmatch(r'a_[0-9a-f]{8}', aid):
+            ans('चुकीचं', True); return
+        if kind == 'tp':
+            t, kb = tp_view(aid)
+            ans() if t else ans('Account सापडला नाही', True)
+            if t:
+                show(chat, mid, t, kb)
+            return
+        if kind == 'tc':
+            a = next((x for x in tgweb.M.accounts_view() if x['id'] == aid), None)
+            if not a:
+                ans('Account सापडला नाही', True); return
+            tgweb.M.set_enabled(aid, not a['enabled'])
+            ans('⏸ Disconnect केलं' if a['enabled'] else '▶️ Connect होतंय…')
+            t, kb = tp_view(aid); show(chat, mid, t, kb); return
+        if kind == 'tr':
+            ans()
+            show(chat, mid, f'🗑 <b>{aid}</b> काढायचा?\n\n• "फक्त server वरून" — Telegram मधलं session चालू राहतं\n'
+                            '• "logout सकट" — Telegram मधलं हे session कायमचं रद्द होतं',
+                 {'inline_keyboard': [[{'text': '🗑 फक्त server वरून काढा', 'callback_data': f'tx:{aid}:0'}],
+                                      [{'text': '🚪 Telegram मधून logout + काढा', 'callback_data': f'tx:{aid}:1'}],
+                                      [{'text': '⬅️ रद्द', 'callback_data': f'tp:{aid}'}]]}); return
+        if kind == 'tx':
+            ok = tgweb.M.remove_account(aid, logout=(len(parts) > 2 and parts[2] == '1'))
+            ans('✅ काढला' if ok else 'सापडला नाही', not ok)
+            t, kb = ta_view(); show(chat, mid, t, kb); return
     if kind == 'adm':
         ans(); t, kb = admins_view(uid); show(chat, mid, t, kb); return
     if kind == 'ar':
@@ -379,6 +429,8 @@ class Store:
             self._warned = True
             print(f'⚠️ MongoDB write failed: {e}')
 
+MONGO_DB = [None]
+
 def make_store():
     uri = os.environ.get('MONGODB_URI', '')
     if not uri:
@@ -388,6 +440,7 @@ def make_store():
         from pymongo import MongoClient
         c = MongoClient(uri, serverSelectionTimeoutMS=8000, socketTimeoutMS=10000)
         coll = c[os.environ.get('MONGODB_DB', 'workerhub')]['auth']
+        MONGO_DB[0] = c[os.environ.get('MONGODB_DB', 'workerhub')]
         coll.find_one({})                           # connection test
         print('✅ MongoDB जोडलं')
         return Store(coll)
@@ -584,6 +637,62 @@ class Auth:
 
 AUTH = Auth(make_store())
 
+app.secret_key = hashlib.sha256(
+    f"flask|{os.environ.get('SESSION_KEY') or COLAB_SECRET}|{TG_TOKEN}".encode()).hexdigest()
+app.config.update(SESSION_COOKIE_SECURE=os.environ.get('COOKIE_SECURE', '1') == '1',
+                  SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Strict')
+TG_ON = bool(tgweb and tgweb.init(app, MONGO_DB[0], lambda t: notify(t)))
+if tgweb and TG_ON:
+    app.config['MAX_CONTENT_LENGTH'] = tgweb.MAX_UPLOAD + 2 * 1024 * 1024
+elif tgweb:
+    print(f'ℹ️ Telegram accounts बंद: {tgweb.reason}')
+
+def send_ephemeral(chat, text, secs=90):
+    """Link/माहिती पाठवतो आणि `secs` नंतर chat मधून आपोआप delete करतो."""
+    r = tg('sendMessage', chat_id=chat, parse_mode='HTML', disable_web_page_preview=True, text=text)
+    m2 = (r.get('result') or {}).get('message_id') if isinstance(r, dict) else None
+    if m2:
+        t = threading.Timer(secs, tg, args=('deleteMessage',), kwargs={'chat_id': chat, 'message_id': m2})
+        t.daemon = True
+        t.start()
+
+TG_EMOJI = {'online': '🟢', 'connecting': '🟡', 'reconnecting': '🟡', 'standby': '⚪', 'disabled': '⏸',
+            'error': '🟠', 'revoked': '🔴'}
+
+def ta_view():
+    back = [{'text': '⬅️ Back', 'callback_data': 'm'}]
+    if not TG_ON:
+        why = tgweb.reason if tgweb else 'module नाही'
+        return (f'👤 <b>Telegram Accounts</b>\n\n❌ बंद आहे: <b>{esc(why)}</b>\n\n'
+                'Render env मध्ये <code>SESSION_KEY</code>, <code>MONGODB_URI</code> '
+                '(आणि <code>TG_API_ID</code>/<code>TG_API_HASH</code>) टाका.'), {'inline_keyboard': [back]}
+    accs = tgweb.M.accounts_view()
+    lines = ['👤 <b>Telegram Accounts</b>', '']
+    rows = []
+    for a in accs:
+        lines.append(f"{TG_EMOJI.get(a['state'], '❔')} <b>{esc(a['label'] or a['name'])}</b> — {a['state']}")
+        rows.append([{'text': f"{TG_EMOJI.get(a['state'], '❔')} {a['label'] or a['name']}", 'callback_data': f"tp:{a['id']}"}])
+    if not accs:
+        lines.append('अजून कोणताही account नाही. UI उघडून ＋ दाबा.')
+    st = tgweb.bw_status()
+    lines += ['', f"📊 {st['used'] / 1048576:.1f} MB / {st['limit'] / 1073741824:.1f} GB ({st['month']})"]
+    rows.append([{'text': '🌐 UI उघडा (एकदाचा link)', 'callback_data': 'tg'}])
+    rows.append(back)
+    return '\n'.join(lines), {'inline_keyboard': rows}
+
+def tp_view(aid):
+    a = next((x for x in tgweb.M.accounts_view() if x['id'] == aid), None)
+    if not a:
+        return None, None
+    t = (f"{TG_EMOJI.get(a['state'], '❔')} <b>{esc(a['label'] or a['name'])}</b>  <code>{aid}</code>\n"
+         f"नाव: {esc(a['name'])} · {esc(a['phone'])}\nस्थिती: {a['state']}"
+         f"{(' — ' + esc(a['err'])) if a['err'] else ''}")
+    kb = {'inline_keyboard': [
+        [{'text': '⏸ Disconnect' if a['enabled'] else '▶️ Connect', 'callback_data': f'tc:{aid}'}],
+        [{'text': '🗑 काढा', 'callback_data': f'tr:{aid}'}],
+        [{'text': '⬅️ Back', 'callback_data': 'ta'}]]}
+    return t, kb
+
 def admins_view(me):
     lines, rows = ['👥 <b>Admins</b>', ''], []
     for a in sorted(AUTH.listing(), key=lambda a: a['since']):
@@ -741,6 +850,8 @@ def start_background():
     _started = True
     threading.Thread(target=bot_loop, daemon=True).start()
     threading.Thread(target=monitor_loop, daemon=True).start()
+    if TG_ON:
+        tgweb.start()
 
 if os.environ.get('NO_BG') != '1':
     start_background()
