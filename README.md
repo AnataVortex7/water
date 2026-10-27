@@ -48,23 +48,35 @@
 4. Connect → Drivers → URI copy करा, `<password>` च्या जागी तुमचा password टाका.
 
 
-## Telegram Accounts (अनेक account, server वर कायम चालू)
-Bot → **👤 Telegram Accounts** → **🌐 UI उघडा (एकदाचा link)** → UI मध्ये **＋** → फोन नंबर, कोड, (असेल तर) 2FA password.
-Login server वर राहतो (MongoDB मध्ये encrypted), म्हणून PC बंद / browser data गेला तरी account चालू.
+## Telegram Accounts (अनेक account, server वर कायम चालू, Telegram सारखा UI)
+Bot → **👤 Telegram Accounts** → **🌐 UI उघडा (एकदाचा link)** → ☰ → **Add account** → फोन, कोड, (असेल तर) 2FA password.
+Login server वर राहतो (MongoDB मध्ये encrypted) → PC बंद / browser data गेला तरी account चालू.
 
 **आवश्यक env:** `MONGODB_URI`, `SESSION_KEY`
 **API (my.telegram.org → API development tools):** `TG_API_ID`, `TG_API_HASH` = default.
-प्रत्येक login ला "Default API" किंवा "वेगळा api_id/api_hash" निवडता येतो (तो त्या account साठी encrypted जतन).
+प्रत्येक login ला "Default API" किंवा "Custom api_id/api_hash" निवडता येतो (तो त्या account साठी encrypted जतन).
 
-`SESSION_KEY` बनवा (एकदाच, सुरक्षित ठिकाणी नोंदवा — हरवली तर accounts परत login करावे लागतील):
+`SESSION_KEY` (एकदाच बनवा, सुरक्षित ठिकाणी नोंदवा — हरवली तर accounts परत login करावे लागतील):
 `python -c "from cryptography.fernet import Fernet;print(Fernet.generate_key().decode())"`
+
+**UI मधलं:** chat list + folders (All/Unread/Personal/Groups/Channels/Bots) + Archived, avatars, unread/mute/pin, typing,
+online/last seen, read ticks, bubbles (reply, forward, edit, delete, pin, copy, select, reactions, formatting/links/spoilers),
+photos/video(Range seek)/voice/audio/files/stickers(static)/GIF, polls (vote), bot inline बटन, location/contact/link preview,
+album grid, in-chat + global search, chat info (bio, username, shared media/files/links/voice/music, members), new chat
+(@username/phone/t.me link, contacts, join), mute/pin/archive/leave, silent + scheduled send, drafts, emoji panel,
+drag-drop/paste upload, light/dark theme, desktop notifications, active sessions (terminate), profile edit, multi-account.
+**नाही:** calls, secret chats, stories, voice recording, sticker sending/animated stickers, polls तयार करणं, forum topics.
+
+**मोठ्या फाइल:** Telegram च्या मर्यादेपर्यंत — 2000 MB (Premium account: 4000 MB). Download streaming (RAM मध्ये नाही) + Range;
+upload 8 MB तुकड्यांत → server disk (/tmp) → Telegram (progress + resume). Render free ची disk जागा मर्यादित असते — पहिल्यांदा
+100-300 MB ने तपासा. 2 GB फाइल = ~2 GB bandwidth खर्च (BW_LIMIT_GB पहा).
 
 | Optional env | default | अर्थ |
 |---|---|---|
-| BW_LIMIT_GB | 4 | महिन्याला server बाहेर जाणारा data; संपला की media बंद, text चालू |
+| BW_LIMIT_GB | 4 | महिन्याला server बाहेर जाणारा data; संपला की मोठ्या फाइल बंद, text चालू |
 | MAX_ACCOUNTS | 6 | जास्तीत जास्त accounts (प्रत्येकी ~30-50 MB RAM अंदाज) |
-| MAX_UPLOAD_MB | 15 | UI मधून पाठवायच्या फाइलची मर्यादा |
-| MAX_MEDIA_MB | 25 | tap करून उघडता येणाऱ्या फाइलची मर्यादा |
+| MAX_UPLOAD_MB | 4000 | वरची कमाल (प्रत्यक्षात Telegram ची मर्यादा: 2000, Premium 4000) |
+| MAX_MEDIA_MB | 4000 | उघडता येणाऱ्या फाइलची कमाल |
 
 सुरक्षा: account जोडणं/काढणं/UI link = 2FA code लागतो (ADMIN_TOTP_SECRET असेल तर). एका वेळी एकच instance
 accounts चालवतो (Mongo lease) — दोन ठिकाणाहून एकच session चालला तर Telegram तो कायमचा रद्द करतो.
@@ -72,7 +84,8 @@ Render redeploy वेळी ~1 मिनिट accounts थांबतात, 
 
 ## Files
 - app.py              : server + control bot (password+2FA login)
-- tgweb.py            : Telegram accounts engine + web UI (/app)
+- tgweb.py            : Telegram accounts engine (backend)
+- tgui.py             : Telegram सारखा web UI (/app)
 - files/worker.py     : तुमचा जुना worker code
 - files/watermark.py  : PC manager
 - files/install.ps1   : PC installer

@@ -1,16 +1,17 @@
 """
-tgweb.py — Render वर अनेक Telegram account चालवणारा web client.
+tgweb.py — Render वर अनेक Telegram account चालवणारा web client (backend).
 
 • Account login server वर (Telethon). Session string Fernet ने encrypt होऊन MongoDB मध्ये.
-  PC बंद झाला / browser data गेला तरी account चालू राहतो.
-• UI: /app — फक्त bot ने दिलेल्या एकदाच चालणाऱ्या link ने उघडतो (बाकी सगळ्यांना रिकामा 404).
-• Bandwidth: media कधीच आपोआप येत नाही (tap केल्यावरच). महिन्याचा counter + मर्यादा.
-• एका वेळी एकच instance accounts चालवतो (Mongo lease) — नाहीतर Telegram session कायमचा रद्द करतो.
+• UI: /app (tgui.py) — फक्त bot ने दिलेल्या एकदाच चालणाऱ्या link ने; बाकी सगळ्यांना रिकामा 404.
+• मोठ्या फाइल (Telegram मर्यादेपर्यंत: 2 GB, Premium 4 GB) RAM मध्ये न घेता तुकड्या-तुकड्यांत
+  (download = streaming + Range; upload = 8 MB chunks → disk → Telegram).
+• Bandwidth: महिन्याचा counter + मर्यादा. एका वेळी एकच instance accounts चालवतो (Mongo lease).
 
-Env: SESSION_KEY (Fernet key), MONGODB_URI, TG_API_ID / TG_API_HASH (default; प्रत्येक login ला वेगळं देता येतं),
-     BW_LIMIT_GB (4), MAX_ACCOUNTS (6), MAX_UPLOAD_MB (15), MAX_MEDIA_MB (25)
+Env: SESSION_KEY, MONGODB_URI, TG_API_ID / TG_API_HASH (default), BW_LIMIT_GB (4), MAX_ACCOUNTS (6),
+     MAX_UPLOAD_MB (4000), MAX_MEDIA_MB (4000)
 """
-import os, io, re, time, json, uuid, atexit, asyncio, threading, secrets, collections
+import os, io, re, time, json, uuid, atexit, shutil, asyncio, tempfile, threading, secrets, collections, urllib.parse
+from datetime import datetime, timezone
 from flask import Blueprint, request, session, jsonify, Response, abort
 
 try:
@@ -18,28 +19,38 @@ try:
 except Exception:                                   # pragma: no cover
     Fernet = None
 try:
-    from telethon import TelegramClient, events
+    from telethon import TelegramClient, events, functions, types, utils
     from telethon.sessions import StringSession
 except Exception:                                   # pragma: no cover
-    TelegramClient = events = StringSession = None
+    TelegramClient = events = functions = types = utils = StringSession = None
+try:
+    from tgui import UI_PAGE, ENTER_PAGE
+except Exception:                                   # pragma: no cover
+    UI_PAGE = ENTER_PAGE = '<!doctype html>UI missing'
 
 SESSION_KEY = os.environ.get('SESSION_KEY', '').strip()
 DEF_API_ID = os.environ.get('TG_API_ID', '').strip()
 DEF_API_HASH = os.environ.get('TG_API_HASH', '').strip()
+MB = 1024 * 1024
 BW_LIMIT = int(float(os.environ.get('BW_LIMIT_GB', '4')) * 1024 ** 3)
 MAX_ACCOUNTS = int(os.environ.get('MAX_ACCOUNTS', '6'))
-MAX_UPLOAD = int(float(os.environ.get('MAX_UPLOAD_MB', '15')) * 1024 * 1024)
-MAX_MEDIA = int(float(os.environ.get('MAX_MEDIA_MB', '25')) * 1024 * 1024)
+TG_LIMIT, TG_LIMIT_PREMIUM = 2000 * MB, 4000 * MB          # Telegram ची खरी मर्यादा
+MAX_UPLOAD = int(float(os.environ.get('MAX_UPLOAD_MB', '4000')) * MB)
+MAX_MEDIA = int(float(os.environ.get('MAX_MEDIA_MB', '4000')) * MB)
 UI_SESSION_SECS = 7200
 LEASE_SECS = 45
-INSTANCE = uuid.uuid4().hex[:8]
+CHUNK = 8 * MB                                              # browser → server upload तुकडा
+REQ = 512 * 1024                                            # server ← Telegram download तुकडा
+UPDIR = os.path.join(tempfile.gettempdir(), 'tgup')
 
-M = None                 # Manager (init() नंतर)
-reason = ''              # feature बंद असेल तर कारण
+M = None
+reason = ''
 TOKENS, TOKENS_LOCK = {}, threading.Lock()
 FAILS = collections.defaultdict(list)
 BW = {'month': '', 'bytes': 0, 'dirty': False}
 BW_LOCK = threading.Lock()
+UP, UP_LOCK = {}, threading.Lock()
+STREAMS = threading.Semaphore(3)
 _F = [None]
 
 
@@ -49,7 +60,7 @@ class ApiError(Exception):
         self.code = code
 
 
-# ───────────────────────── crypto ─────────────────────────
+# ───────────────────────── crypto / bandwidth ─────────────────────────
 def _fernet():
     if _F[0] is None:
         _F[0] = Fernet(SESSION_KEY.encode())
@@ -61,8 +72,6 @@ def enc(s):
 def dec(t):
     return _fernet().decrypt(t.encode()).decode()
 
-
-# ───────────────────────── bandwidth ─────────────────────────
 def _month():
     return time.strftime('%Y-%m')
 
@@ -80,7 +89,10 @@ def bw_status():
         return {'used': BW['bytes'], 'limit': BW_LIMIT, 'month': BW['month']}
 
 
-# ───────────────────────── serialization (Telethon objects → JSON) ─────────────────────────
+# ───────────────────────── serialization ─────────────────────────
+def _t(x):
+    return x if isinstance(x, str) else (getattr(x, 'text', '') or '')
+
 def _name(e):
     if e is None:
         return ''
@@ -89,6 +101,11 @@ def _name(e):
         return str(t)
     return ' '.join(str(x) for x in (getattr(e, 'first_name', None), getattr(e, 'last_name', None)) if x) \
         or str(getattr(e, 'username', '') or '')
+
+def _ts(d):
+    if d is None:
+        return 0
+    return int(d.timestamp()) if hasattr(d, 'timestamp') else int(d)
 
 def media_info(m):
     if not getattr(m, 'media', None):
@@ -100,31 +117,134 @@ def media_info(m):
         if getattr(m, attr, None):
             kind = k
             break
-    return {'kind': kind, 'size': int(getattr(f, 'size', 0) or 0),
-            'name': str(getattr(f, 'name', '') or ''), 'mime': str(getattr(f, 'mime_type', '') or '')}
+    return {'kind': kind, 'size': int(getattr(f, 'size', 0) or 0), 'name': str(getattr(f, 'name', '') or ''),
+            'mime': str(getattr(f, 'mime_type', '') or ''), 'dur': int(getattr(f, 'duration', 0) or 0),
+            'w': int(getattr(f, 'width', 0) or 0), 'h': int(getattr(f, 'height', 0) or 0),
+            'emoji': str(getattr(f, 'emoji', '') or '')}
+
+def ser_entities(m):
+    out = []
+    for e in (getattr(m, 'entities', None) or []):
+        t = type(e).__name__.replace('MessageEntity', '').lower()
+        d = {'t': t, 'o': int(e.offset), 'l': int(e.length)}
+        if t == 'texturl':
+            d['u'] = getattr(e, 'url', '')
+        out.append(d)
+    return out
+
+def ser_reactions(m):
+    r = getattr(m, 'reactions', None)
+    if not r or not getattr(r, 'results', None):
+        return None
+    out = []
+    for x in r.results:
+        em = getattr(x.reaction, 'emoticon', None)
+        if em:
+            out.append({'e': em, 'n': int(x.count), 'me': getattr(x, 'chosen_order', None) is not None})
+    return out or None
+
+def ser_poll(m):
+    mp = getattr(m, 'poll', None)
+    if not mp:
+        return None
+    p, res = mp.poll, getattr(mp, 'results', None)
+    rmap = {}
+    for r in (getattr(res, 'results', None) or []):
+        rmap[bytes(r.option)] = r
+    answers = []
+    for i, a in enumerate(p.answers):
+        r = rmap.get(bytes(a.option))
+        answers.append({'i': i, 't': _t(a.text), 'n': int(r.voters) if r else 0,
+                        'me': bool(r and r.chosen), 'ok': bool(r and getattr(r, 'correct', False))})
+    return {'q': _t(p.question), 'a': answers, 'closed': bool(p.closed), 'multi': bool(p.multiple_choice),
+            'quiz': bool(p.quiz), 'total': int(getattr(res, 'total_voters', 0) or 0)}
+
+def ser_web(m):
+    w = getattr(m, 'web_preview', None)
+    if not w or not getattr(w, 'url', None):
+        return None
+    return {'url': w.url, 'title': _t(getattr(w, 'title', '')), 'desc': _t(getattr(w, 'description', ''))[:300],
+            'site': _t(getattr(w, 'site_name', '')), 'photo': bool(getattr(w, 'photo', None))}
+
+def ser_buttons(m):
+    rm = getattr(m, 'reply_markup', None)
+    if not rm or type(rm).__name__ != 'ReplyInlineMarkup':
+        return None
+    rows = []
+    for row in (getattr(m, 'buttons', None) or []):
+        rows.append([{'t': b.text, 'u': getattr(b, 'url', None) or None, 'cb': bool(getattr(b, 'data', None))} for b in row])
+    return rows or None
+
+ACTIONS = {'ChatAddUser': 'joined the group', 'ChatJoinedByLink': 'joined via invite link', 'ChatDeleteUser': 'left the group',
+           'ChatEditTitle': 'changed the group name', 'ChatEditPhoto': 'changed the group photo', 'PinMessage': 'pinned a message',
+           'ChatCreate': 'created the group', 'ChannelCreate': 'created the channel', 'ContactSignUp': 'joined Telegram',
+           'HistoryClear': 'history cleared', 'PhoneCall': 'call', 'ChatJoinedByRequest': 'joined by request'}
+
+def action_text(a):
+    n = type(a).__name__.replace('MessageAction', '')
+    return ACTIONS.get(n) or re.sub(r'(?<!^)(?=[A-Z])', ' ', n).lower()
 
 def ser_msg(m):
     rt = getattr(m, 'reply_to', None)
     text = getattr(m, 'message', '') or ''
-    if not text and getattr(m, 'action', None):
-        text = '⚙️ ' + type(m.action).__name__
-    d = getattr(m, 'date', None)
-    return {'id': m.id, 'out': bool(getattr(m, 'out', False)), 'ts': int(d.timestamp()) if d else 0,
-            'text': text, 'from': _name(getattr(m, 'sender', None)),
+    service = bool(getattr(m, 'action', None))
+    if service and not text:
+        text = action_text(m.action)
+    fw = getattr(m, 'forward', None)
+    geo = getattr(m, 'geo', None)
+    ct = getattr(m, 'contact', None)
+    dice = getattr(m, 'dice', None)
+    venue = getattr(m, 'venue', None)
+    return {'id': m.id, 'out': bool(getattr(m, 'out', False)), 'ts': _ts(getattr(m, 'date', None)), 'text': text,
+            'service': service, 'from': _name(getattr(m, 'sender', None)), 'from_id': getattr(m, 'sender_id', None),
             'reply': getattr(rt, 'reply_to_msg_id', None) if rt else None,
-            'edited': bool(getattr(m, 'edit_date', None)), 'fwd': bool(getattr(m, 'fwd_from', None)),
-            'media': media_info(m)}
+            'edited': bool(getattr(m, 'edit_date', None)),
+            'fwd': (getattr(fw, 'from_name', None) or _name(getattr(fw, 'sender', None)) or _name(getattr(fw, 'chat', None)) or 'Unknown') if fw else '',
+            'via': _name(getattr(m, 'via_bot', None)), 'media': media_info(m), 'ents': ser_entities(m),
+            'react': ser_reactions(m), 'poll': ser_poll(m), 'web': ser_web(m), 'btn': ser_buttons(m),
+            'geo': {'lat': geo.lat, 'lon': geo.long, 'title': getattr(venue, 'title', '')} if geo else None,
+            'contact': {'name': f"{getattr(ct, 'first_name', '')} {getattr(ct, 'last_name', '')}".strip(), 'phone': getattr(ct, 'phone_number', '')} if ct else None,
+            'dice': {'e': dice.emoticon, 'v': dice.value} if dice else None,
+            'grp': getattr(m, 'grouped_id', None), 'views': getattr(m, 'views', None), 'pinned': bool(getattr(m, 'pinned', False))}
+
+def _muted(d):
+    ns = getattr(getattr(d, 'dialog', None), 'notify_settings', None)
+    mu = getattr(ns, 'mute_until', None)
+    return bool(mu and _ts(mu) > time.time())
 
 def ser_dialog(d):
     m = d.message
     last = (getattr(m, 'message', '') or '') if m else ''
+    if m and not last and getattr(m, 'action', None):
+        last = action_text(m.action)
     if m and not last and getattr(m, 'media', None):
-        last = '📎 ' + (media_info(m) or {}).get('kind', 'media')
-    dt = getattr(m, 'date', None) if m else None
+        mi = media_info(m) or {}
+        last = '📎 ' + (mi.get('emoji') or mi.get('kind', 'media'))
+    ent, raw = getattr(d, 'entity', None), getattr(d, 'dialog', None)
+    st = type(getattr(ent, 'status', None)).__name__
     kind = 'user' if d.is_user else ('group' if d.is_group else 'channel')
-    return {'id': d.id, 'name': d.name or '', 'unread': d.unread_count or 0, 'last': last[:90],
-            'ts': int(dt.timestamp()) if dt else 0, 'type': kind, 'pinned': bool(getattr(d, 'pinned', False)),
-            'out': bool(getattr(m, 'out', False)) if m else False}
+    return {'id': d.id, 'name': 'Saved Messages' if getattr(ent, 'is_self', False) else (d.name or ''),
+            'self': bool(getattr(ent, 'is_self', False)), 'unread': d.unread_count or 0,
+            'mentions': int(getattr(raw, 'unread_mentions_count', 0) or 0), 'last': last[:90], 'ts': _ts(getattr(m, 'date', None)) if m else 0,
+            'type': kind, 'pinned': bool(getattr(d, 'pinned', False)), 'out': bool(getattr(m, 'out', False)) if m else False,
+            'muted': _muted(d), 'bot': bool(getattr(ent, 'bot', False)), 'verified': bool(getattr(ent, 'verified', False)),
+            'online': st == 'UserStatusOnline', 'read_out': int(getattr(raw, 'read_outbox_max_id', 0) or 0),
+            'read_in': int(getattr(raw, 'read_inbox_max_id', 0) or 0), 'archived': bool(getattr(d, 'archived', False))}
+
+def status_text(ent):
+    st = type(getattr(ent, 'status', None)).__name__
+    if st == 'UserStatusOnline':
+        return 'online'
+    if st == 'UserStatusOffline':
+        w = getattr(ent.status, 'was_online', None)
+        return 'last seen ' + (datetime.fromtimestamp(_ts(w)).strftime('%d %b %H:%M') if w else 'recently')
+    return {'UserStatusRecently': 'last seen recently', 'UserStatusLastWeek': 'last seen within a week',
+            'UserStatusLastMonth': 'last seen within a month'}.get(st, '')
+
+def _thumb_index(m):
+    media = getattr(m, 'photo', None) or getattr(m, 'document', None) or getattr(getattr(m, 'web_preview', None), 'photo', None)
+    sizes = getattr(media, 'sizes', None) or getattr(media, 'thumbs', None) or []
+    return min(2, len(sizes) - 1) if len(sizes) else None
 
 
 def default_factory(sess, api_id, api_hash):
@@ -132,11 +252,22 @@ def default_factory(sess, api_id, api_hash):
                           app_version='1.0', system_version='Linux', lang_code='en',
                           connection_retries=None, retry_delay=3, auto_reconnect=True, flood_sleep_threshold=60)
 
-client_factory = default_factory          # tests मध्ये बदलता येतो
-
+client_factory = default_factory
 
 REVOKED = {'AuthKeyUnregisteredError', 'SessionRevokedError', 'UserDeactivatedError',
            'UserDeactivatedBanError', 'AuthKeyDuplicatedError', 'SessionExpiredError', 'PermissionError'}
+
+FILTERS = {'media': 'InputMessagesFilterPhotoVideo', 'files': 'InputMessagesFilterDocument', 'links': 'InputMessagesFilterUrl',
+           'voice': 'InputMessagesFilterVoice', 'music': 'InputMessagesFilterMusic', 'gifs': 'InputMessagesFilterGif'}
+
+
+def _lru_put(od, key, val, cap_items=300, cap_bytes=16 * MB):
+    od[key] = val
+    od.move_to_end(key)
+    total = sum(len(v or b'') for v in od.values())
+    while od and (len(od) > cap_items or total > cap_bytes):
+        _, v = od.popitem(last=False)
+        total -= len(v or b'')
 
 
 # ───────────────────────── Manager ─────────────────────────
@@ -147,13 +278,15 @@ class Manager:
         self.loop = asyncio.new_event_loop()
         self.clients, self.state, self.next_try = {}, {}, {}
         self.logins, self.cache = {}, {}
-        self.events = collections.deque(maxlen=500)
+        self.events = collections.deque(maxlen=800)
         self.seq = 0
         self.cond = threading.Condition()
         self.lease = False
         self.last_ping = {}
-        self.media_sem = None
+        self.premium = {}
         self.instance = uuid.uuid4().hex[:8]
+        self.avatars, self.thumbs = collections.OrderedDict(), collections.OrderedDict()
+        self.up_tasks = {}
 
     # --- thread / loop
     def start(self):
@@ -168,7 +301,7 @@ class Manager:
 
     def _run(self):
         asyncio.set_event_loop(self.loop)
-        self.media_sem = asyncio.Semaphore(2)
+        self.avatar_sem = asyncio.Semaphore(3)
         self.loop.create_task(self.supervisor())
         self.loop.run_forever()
 
@@ -178,7 +311,7 @@ class Manager:
             raise ApiError('Telegram engine अजून सुरू झालं नाही — थोड्या वेळाने प्रयत्न करा', 503)
         return asyncio.run_coroutine_threadsafe(coro, self.loop).result(timeout)
 
-    # --- lease (एकाच वेळी एकच instance)
+    # --- lease
     def _lease(self):
         now = time.time()
         try:
@@ -189,7 +322,7 @@ class Manager:
                 upsert=True, return_document=ReturnDocument.AFTER)
             return bool(r and r.get('owner') == self.instance)
         except Exception:
-            return False                           # DuplicateKey = दुसऱ्या instance कडे lease
+            return False
 
     def _release(self):
         try:
@@ -211,10 +344,24 @@ class Manager:
         except Exception as e:
             print('bw flush failed:', e)
 
+    def _cleanup_uploads(self):
+        try:
+            now = time.time()
+            for d in os.listdir(UPDIR):
+                p = os.path.join(UPDIR, d)
+                if now - os.path.getmtime(p) > 6 * 3600:
+                    shutil.rmtree(p, ignore_errors=True)
+                    with UP_LOCK:
+                        UP.pop(d, None)
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            print('upload cleanup:', e)
+
     # --- supervisor
     async def supervisor(self):
         loop = asyncio.get_running_loop()
-        last_bw = 0
+        last_bw = last_clean = 0
         while True:
             try:
                 got = await loop.run_in_executor(None, self._lease)
@@ -228,6 +375,9 @@ class Manager:
                 if time.time() - last_bw > 30:
                     await loop.run_in_executor(None, self._flush_bw)
                     last_bw = time.time()
+                if time.time() - last_clean > 1800:
+                    await loop.run_in_executor(None, self._cleanup_uploads)
+                    last_clean = time.time()
             except Exception as e:
                 print('supervisor error:', e)
             await asyncio.sleep(15)
@@ -279,7 +429,9 @@ class Manager:
             await asyncio.wait_for(cl.connect(), 45)
             if not await cl.is_user_authorized():
                 raise PermissionError('session रद्द / लॉगआउट झालं')
-            await asyncio.wait_for(cl.get_dialogs(limit=100), 90)        # entity cache भरतो
+            me = await cl.get_me()
+            self.premium[aid] = bool(getattr(me, 'premium', False))
+            await asyncio.wait_for(cl.get_dialogs(limit=100), 90)
             self._hook(aid, cl)
             self.clients[aid] = cl
             self.state[aid] = {'state': 'online', 'err': ''}
@@ -310,84 +462,361 @@ class Manager:
             self.push(aid, 'edit', getattr(ev, 'chat_id', None), ser_msg(ev.message))
         async def on_del(ev):
             self.push(aid, 'del', getattr(ev, 'chat_id', None), None, list(getattr(ev, 'deleted_ids', []) or []))
+        async def on_read(ev):
+            if getattr(ev, 'outbox', False):
+                self.push(aid, 'read', getattr(ev, 'chat_id', None), None, None, max_id=getattr(ev, 'max_id', 0))
+        async def on_user(ev):
+            act = 'typing' if getattr(ev, 'typing', False) else 'recording' if getattr(ev, 'recording', False) \
+                else 'uploading' if getattr(ev, 'uploading', False) else ''
+            who = ''
+            try:
+                who = _name(await ev.get_user())
+            except Exception:
+                pass
+            self.push(aid, 'typing', getattr(ev, 'chat_id', None) or getattr(ev, 'user_id', None), None, None,
+                      action=act, who=who, online=bool(getattr(ev, 'online', False)))
         cl.add_event_handler(on_new, events.NewMessage())
         cl.add_event_handler(on_edit, events.MessageEdited())
         cl.add_event_handler(on_del, events.MessageDeleted())
+        cl.add_event_handler(on_read, events.MessageRead())
+        cl.add_event_handler(on_user, events.UserUpdate())
 
-    def push(self, aid, kind, chat_id, msg, ids=None):
-        self.cache.pop(aid, None)
+    def push(self, aid, kind, chat_id, msg, ids=None, **extra):
+        if kind in ('new', 'edit', 'del', 'read'):
+            self.cache.pop(aid, None)
         with self.cond:
             self.seq += 1
-            self.events.append({'seq': self.seq, 'acc': aid, 'type': kind, 'chat': chat_id, 'msg': msg, 'ids': ids})
+            self.events.append({'seq': self.seq, 'acc': aid, 'type': kind, 'chat': chat_id, 'msg': msg, 'ids': ids, **extra})
             self.cond.notify_all()
 
-    # --- helpers
     def _cl(self, aid):
         cl = self.clients.get(aid)
         if not cl:
             raise ApiError('हा account सध्या online नाही', 409)
         return cl
 
-    # --- API coroutines (Flask thread वरून call() ने)
-    async def a_dialogs(self, aid):
-        c = self.cache.get(aid)
+    def limit_for(self, aid):
+        return min(MAX_UPLOAD, TG_LIMIT_PREMIUM if self.premium.get(aid) else TG_LIMIT)
+
+    # ═══════════ API coroutines ═══════════
+    async def a_dialogs(self, aid, archived=False):
+        key = (aid, archived)
+        c = self.cache.get(key)
         if c and time.time() - c[0] < 8:
             return c[1]
-        out = [ser_dialog(d) for d in await self._cl(aid).get_dialogs(limit=60)]
-        self.cache[aid] = (time.time(), out)
+        ds = await self._cl(aid).get_dialogs(limit=120, folder=1 if archived else 0)
+        out = [ser_dialog(d) for d in ds]
+        self.cache[key] = (time.time(), out)
         return out
 
     async def a_messages(self, aid, chat, before, limit):
-        ms = await self._cl(aid).get_messages(chat, limit=limit, offset_id=before or 0)
+        cl = self._cl(aid)
+        ms = await cl.get_messages(chat, limit=limit, offset_id=before or 0)
+        res = {'messages': [ser_msg(m) for m in reversed(list(ms))]}
+        if not before:
+            res['pinned'] = None
+            try:
+                pm = await cl.get_messages(chat, limit=1, filter=types.InputMessagesFilterPinned())
+                if pm:
+                    res['pinned'] = {'id': pm[0].id, 'text': (pm[0].message or '📎')[:100]}
+            except Exception:
+                pass
+            try:
+                peer = await cl.get_input_entity(chat)
+                pd = await cl(functions.messages.GetPeerDialogsRequest(peers=[types.InputDialogPeer(peer=peer)]))
+                res['read_out'] = int(pd.dialogs[0].read_outbox_max_id)
+                res['read_in'] = int(pd.dialogs[0].read_inbox_max_id)
+            except Exception:
+                res['read_out'] = res['read_in'] = 0
+        return res
+
+    async def a_around(self, aid, chat, mid):
+        ms = await self._cl(aid).get_messages(chat, limit=30, offset_id=mid, add_offset=-15)
         return [ser_msg(m) for m in reversed(list(ms))]
 
-    async def a_send(self, aid, chat, text, reply_to):
-        m = await self._cl(aid).send_message(chat, text, reply_to=reply_to or None)
+    async def a_search(self, aid, q, chat):
+        cl = self._cl(aid)
+        ms = await cl.get_messages(chat if chat else None, search=q, limit=30)
+        out = []
+        for m in ms:
+            d = ser_msg(m)
+            d['chat'] = getattr(m, 'chat_id', None)
+            d['chat_name'] = _name(getattr(m, 'chat', None))
+            out.append(d)
+        return out
+
+    async def a_send(self, aid, chat, text, reply_to, md, silent, schedule, preview):
+        kw = {}
+        if schedule:
+            kw['schedule'] = datetime.fromtimestamp(int(schedule), tz=timezone.utc)
+        m = await self._cl(aid).send_message(chat, text, reply_to=reply_to or None, parse_mode='md' if md else None,
+                                             silent=bool(silent), link_preview=bool(preview), **kw)
         bw_add(len(text.encode()) + 300)
         return ser_msg(m)
 
-    async def a_edit(self, aid, chat, mid, text):
-        m = await self._cl(aid).edit_message(chat, mid, text)
+    async def a_edit(self, aid, chat, mid, text, md):
+        m = await self._cl(aid).edit_message(chat, mid, text, parse_mode='md' if md else None)
         bw_add(len(text.encode()) + 300)
         return ser_msg(m)
 
-    async def a_delete(self, aid, chat, mid):
-        await self._cl(aid).delete_messages(chat, [mid])
+    async def a_delete(self, aid, chat, ids, revoke):
+        await self._cl(aid).delete_messages(chat, ids, revoke=bool(revoke))
+
+    async def a_forward(self, aid, from_chat, ids, to_chat, hide):
+        ms = await self._cl(aid).forward_messages(to_chat, ids, from_peer=from_chat, drop_author=bool(hide))
+        ms = ms if isinstance(ms, list) else [ms]
+        return [ser_msg(m) for m in ms if m]
+
+    async def a_pin(self, aid, chat, mid, unpin):
+        cl = self._cl(aid)
+        if unpin:
+            await cl.unpin_message(chat, mid)
+        else:
+            await cl.pin_message(chat, mid, notify=False)
+
+    async def a_react(self, aid, chat, mid, emoji):
+        cl = self._cl(aid)
+        peer = await cl.get_input_entity(chat)
+        await cl(functions.messages.SendReactionRequest(
+            peer=peer, msg_id=mid, reaction=[types.ReactionEmoji(emoticon=emoji)] if emoji else []))
+        m = await cl.get_messages(chat, ids=mid)
+        return ser_msg(m) if m else None
+
+    async def a_vote(self, aid, chat, mid, idxs):
+        cl = self._cl(aid)
+        m = await cl.get_messages(chat, ids=mid)
+        if not m or not getattr(m, 'poll', None):
+            raise ApiError('poll सापडला नाही', 404)
+        answers = m.poll.poll.answers
+        opts = [answers[i].option for i in idxs if 0 <= i < len(answers)]
+        peer = await cl.get_input_entity(chat)
+        await cl(functions.messages.SendVoteRequest(peer=peer, msg_id=mid, options=opts))
+        m = await cl.get_messages(chat, ids=mid)
+        return ser_msg(m)
+
+    async def a_click(self, aid, chat, mid, i, j):
+        cl = self._cl(aid)
+        m = await cl.get_messages(chat, ids=mid)
+        if not m:
+            raise ApiError('message सापडला नाही', 404)
+        res = await m.click(i, j)
+        return {'text': getattr(res, 'message', None), 'alert': bool(getattr(res, 'alert', False)), 'url': getattr(res, 'url', None)}
 
     async def a_read(self, aid, chat, max_id):
-        await self._cl(aid).send_read_acknowledge(chat, max_id=max_id)
+        await self._cl(aid).send_read_acknowledge(chat, max_id=max_id, clear_mentions=True)
 
-    async def a_upload(self, aid, chat, data, name, caption):
-        bio = io.BytesIO(data)
-        bio.name = name or 'file'
-        m = await self._cl(aid).send_file(chat, bio, caption=caption or None)
-        bw_add(len(data) + 500)
-        return ser_msg(m)
+    async def a_typing(self, aid, chat):
+        cl = self._cl(aid)
+        peer = await cl.get_input_entity(chat)
+        await cl(functions.messages.SetTypingRequest(peer=peer, action=types.SendMessageTypingAction()))
 
-    async def a_media(self, aid, chat, mid, thumb, confirm):
+    async def a_mute(self, aid, chat, mute):
+        cl = self._cl(aid)
+        peer = await cl.get_input_entity(chat)
+        await cl(functions.account.UpdateNotifySettingsRequest(
+            peer=types.InputNotifyPeer(peer=peer), settings=types.InputPeerNotifySettings(mute_until=2147483647 if mute else 0)))
+        self.cache.pop((aid, False), None)
+
+    async def a_chatpin(self, aid, chat, pin):
+        cl = self._cl(aid)
+        peer = await cl.get_input_entity(chat)
+        await cl(functions.messages.ToggleDialogPinRequest(peer=types.InputDialogPeer(peer=peer), pinned=bool(pin)))
+        self.cache.clear()
+
+    async def a_archive(self, aid, chat, archive):
+        await self._cl(aid).edit_folder(chat, 1 if archive else 0)
+        self.cache.clear()
+
+    async def a_chatdelete(self, aid, chat):
+        await self._cl(aid).delete_dialog(chat)
+        self.cache.clear()
+
+    def _dlg(self, ent):
+        kind = 'user' if type(ent).__name__ == 'User' else ('channel' if getattr(ent, 'broadcast', False) else 'group')
+        return {'id': utils.get_peer_id(ent), 'name': _name(ent), 'type': kind, 'username': getattr(ent, 'username', '') or '',
+                'unread': 0, 'last': '', 'ts': 0, 'pinned': False, 'muted': False, 'out': False, 'bot': bool(getattr(ent, 'bot', False)),
+                'verified': bool(getattr(ent, 'verified', False)), 'online': False, 'mentions': 0, 'read_out': 0, 'read_in': 0, 'self': False}
+
+    async def a_resolve(self, aid, q):
+        q = q.strip()
+        if not q:
+            raise ApiError('नाव / username द्या')
+        q = re.sub(r'^https?://t\.me/', '', q).lstrip('@')
+        try:
+            ent = await self._cl(aid).get_entity(q if not q.lstrip('+').isdigit() or q.startswith('+') else int(q))
+        except ApiError:
+            raise
+        except Exception as e:
+            raise ApiError(f'सापडलं नाही: {e}'[:140], 404)
+        return self._dlg(ent)
+
+    async def a_join(self, aid, q):
+        cl = self._cl(aid)
+        q = q.strip()
+        m = re.search(r'(?:t\.me/\+|joinchat/)([\w-]+)', q)
+        if m:
+            upd = await cl(functions.messages.ImportChatInviteRequest(m.group(1)))
+            ent = upd.chats[0] if getattr(upd, 'chats', None) else None
+        else:
+            ent = await cl.get_entity(re.sub(r'^https?://t\.me/', '', q).lstrip('@'))
+            await cl(functions.channels.JoinChannelRequest(ent))
+        if ent is None:
+            raise ApiError('join झालं पण chat मिळाला नाही')
+        self.cache.clear()
+        return self._dlg(ent)
+
+    async def a_contacts(self, aid):
+        r = await self._cl(aid)(functions.contacts.GetContactsRequest(hash=0))
+        return sorted(({'id': u.id, 'name': _name(u), 'username': getattr(u, 'username', '') or '', 'online': type(getattr(u, 'status', None)).__name__ == 'UserStatusOnline'}
+                       for u in r.users), key=lambda x: x['name'].lower())
+
+    async def a_chatinfo(self, aid, chat):
+        cl = self._cl(aid)
+        ent = await cl.get_entity(chat)
+        kind = type(ent).__name__
+        info = {'id': chat, 'name': _name(ent), 'username': getattr(ent, 'username', '') or '', 'phone': getattr(ent, 'phone', '') or '',
+                'about': '', 'members': None, 'status': status_text(ent), 'type': 'user' if kind == 'User' else ('channel' if getattr(ent, 'broadcast', False) else 'group'),
+                'bot': bool(getattr(ent, 'bot', False)), 'verified': bool(getattr(ent, 'verified', False)), 'self': bool(getattr(ent, 'is_self', False))}
+        try:
+            if kind == 'User':
+                f = await cl(functions.users.GetFullUserRequest(ent))
+                info['about'] = getattr(f.full_user, 'about', '') or ''
+            elif kind == 'Channel':
+                f = await cl(functions.channels.GetFullChannelRequest(ent))
+                info['about'] = getattr(f.full_chat, 'about', '') or ''
+                info['members'] = getattr(f.full_chat, 'participants_count', None)
+            else:
+                f = await cl(functions.messages.GetFullChatRequest(chat_id=ent.id))
+                info['about'] = getattr(f.full_chat, 'about', '') or ''
+                info['members'] = len(getattr(getattr(f.full_chat, 'participants', None), 'participants', []) or [])
+        except Exception:
+            pass
+        if info['type'] == 'group' and info['members']:
+            info['status'] = f"{info['members']} members"
+        elif info['type'] == 'channel' and info['members']:
+            info['status'] = f"{info['members']} subscribers"
+        return info
+
+    async def a_members(self, aid, chat, q):
+        ps = await self._cl(aid).get_participants(chat, limit=100, search=q or '')
+        return [{'id': p.id, 'name': _name(p), 'username': getattr(p, 'username', '') or '', 'bot': bool(getattr(p, 'bot', False)),
+                 'status': status_text(p)} for p in ps]
+
+    async def a_shared(self, aid, chat, kind, before):
+        if kind not in FILTERS:
+            raise ApiError('चुकीचा प्रकार')
+        ms = await self._cl(aid).get_messages(chat, limit=30, offset_id=before or 0, filter=getattr(types, FILTERS[kind])())
+        return [ser_msg(m) for m in ms]
+
+    async def a_sessions(self, aid):
+        r = await self._cl(aid)(functions.account.GetAuthorizationsRequest())
+        return [{'hash': str(a.hash), 'device': a.device_model, 'platform': a.platform, 'app': f'{a.app_name} {a.app_version}',
+                 'ip': a.ip, 'country': a.country, 'created': _ts(a.date_created), 'active': _ts(a.date_active), 'current': bool(a.current)}
+                for a in r.authorizations]
+
+    async def a_terminate(self, aid, h):
+        await self._cl(aid)(functions.account.ResetAuthorizationRequest(hash=int(h)))
+
+    async def a_setme(self, aid, first, last, about):
+        await self._cl(aid)(functions.account.UpdateProfileRequest(first_name=first or None, last_name=last, about=about))
+
+    async def a_avatar(self, aid, chat):
+        key = (aid, chat)
+        if key in self.avatars:
+            return self.avatars[key]
+        async with self.avatar_sem:
+            cl = self._cl(aid)
+            peer = await cl.get_input_entity(chat)
+            data = await cl.download_profile_photo(peer, file=bytes, download_big=False)
+        _lru_put(self.avatars, key, data or b'', 500, 20 * MB)
+        return data or b''
+
+    async def a_thumb(self, aid, chat, mid):
+        key = (aid, chat, mid)
+        if key in self.thumbs:
+            return self.thumbs[key]
         cl = self._cl(aid)
         m = await cl.get_messages(chat, ids=mid)
         info = media_info(m) if m else None
         if not info:
+            raise ApiError('media नाही', 404)
+        idx = _thumb_index(m)
+        if info['kind'] == 'sticker' and 0 < info['size'] < 400 * 1024 and 'webp' in info['mime']:
+            data = (await cl.download_media(m, file=bytes),)
+        elif idx is not None:
+            data = (await cl.download_media(m, file=bytes, thumb=idx),)
+        elif info['kind'] == 'photo' and 0 < info['size'] < 300 * 1024:
+            data = (await cl.download_media(m, file=bytes),)
+        else:
+            raise ApiError('thumb नाही', 404)
+        if not data[0]:
+            raise ApiError('thumb अयशस्वी', 502)
+        _lru_put(self.thumbs, key, data[0], 400, 16 * MB)
+        return data[0]
+
+    async def a_info(self, aid, chat, mid):
+        m = await self._cl(aid).get_messages(chat, ids=mid)
+        info = media_info(m) if m else None
+        if not info:
             raise ApiError('media सापडला नाही', 404)
-        size = info['size']
-        if size > MAX_MEDIA and not thumb:
-            raise ApiError(f'फाइल {MAX_MEDIA // 1048576} MB पेक्षा मोठी आहे', 413)
-        st = bw_status()
-        if st['used'] + size > st['limit']:
-            raise ApiError('या महिन्याची bandwidth मर्यादा संपली — फक्त text चालतो', 429)
-        async with self.media_sem:
-            if thumb:
-                try:
-                    data = await cl.download_media(m, file=bytes, thumb=-1)
-                except Exception:
-                    data = None
-            else:
-                data = await cl.download_media(m, file=bytes)
-        if not data:
-            raise ApiError('download अयशस्वी', 502)
-        bw_add(len(data))
-        return data, info
+        return info
+
+    async def a_iter(self, aid, chat, mid, offset, size):
+        cl = self._cl(aid)
+        m = await cl.get_messages(chat, ids=mid)
+        it = cl.iter_download(m.media, offset=offset, chunk_size=REQ, request_size=REQ, file_size=size)
+        return it.__aiter__()
+
+    async def a_next(self, it):
+        try:
+            return await it.__anext__()
+        except StopAsyncIteration:
+            return None
+
+    async def a_close(self, it):
+        try:
+            c = getattr(it, 'close', None)
+            if c:
+                r = c()
+                if asyncio.iscoroutine(r):
+                    await r
+        except Exception:
+            pass
+
+    # --- मोठ्या फाइलचा upload (disk वरून Telegram ला, progress सकट)
+    async def a_send_file(self, up_id):
+        with UP_LOCK:
+            up = UP.get(up_id)
+        if not up:
+            return
+        last = [0.0]
+        def prog(sent, total):
+            up['sent'] = int(sent)
+            if time.time() - last[0] > 0.7:
+                last[0] = time.time()
+                self.push(up['acc'], 'up', up['chat'], None, None, uid=up_id, sent=int(sent), total=int(total), state='sending', name=up['name'])
+        try:
+            kw = {}
+            if up.get('schedule'):
+                kw['schedule'] = datetime.fromtimestamp(int(up['schedule']), tz=timezone.utc)
+            m = await self._cl(up['acc']).send_file(
+                up['chat'], up['path'], caption=up.get('caption') or None, force_document=bool(up.get('as_file')),
+                reply_to=up.get('reply_to') or None, silent=bool(up.get('silent')), supports_streaming=True,
+                parse_mode='md' if up.get('md') else None, progress_callback=prog, **kw)
+            m = m[0] if isinstance(m, list) else m
+            bw_add(up['size'] + 500)
+            up.update(state='done', msg=ser_msg(m))
+            self.push(up['acc'], 'up', up['chat'], up['msg'], None, uid=up_id, sent=up['size'], total=up['size'], state='done', name=up['name'])
+        except asyncio.CancelledError:
+            up['state'] = 'canceled'
+            self.push(up['acc'], 'up', up['chat'], None, None, uid=up_id, state='canceled', name=up['name'])
+            raise
+        except Exception as e:
+            up.update(state='error', err=f'{e}'[:160])
+            self.push(up['acc'], 'up', up['chat'], None, None, uid=up_id, state='error', err=up['err'], name=up['name'])
+        finally:
+            shutil.rmtree(os.path.dirname(up['path']), ignore_errors=True)
+            self.up_tasks.pop(up_id, None)
 
     # --- login
     def expire_logins(self):
@@ -468,6 +897,7 @@ class Manager:
                'session_enc': enc(cl.session.save()), 'created': time.time(), 'enabled': True}
         await loop.run_in_executor(None, self.acc.insert_one, doc)
         self.logins.pop(lid, None)
+        self.premium[aid] = bool(getattr(me, 'premium', False))
         try:
             await asyncio.wait_for(cl.get_dialogs(limit=100), 90)
         except Exception:
@@ -488,7 +918,8 @@ class Manager:
             if not self.lease and d.get('enabled', True):
                 st = {'state': 'standby', 'err': 'दुसरा instance चालवतोय'}
             out.append({'id': d['_id'], 'label': d.get('label', ''), 'name': d.get('name', ''), 'phone': d.get('phone', ''),
-                        'enabled': d.get('enabled', True), 'state': st['state'], 'err': st.get('err', '')})
+                        'uid': d.get('uid'), 'enabled': d.get('enabled', True), 'state': st['state'], 'err': st.get('err', ''),
+                        'premium': self.premium.get(d['_id'], False), 'max_upload': self.limit_for(d['_id'])})
         return out
 
     def set_enabled(self, aid, on):
@@ -534,6 +965,12 @@ def _ip():
 def session_ok():
     return bool(session.get('tg_ok')) and time.time() < session.get('tg_exp', 0)
 
+def _sec_headers():
+    return {'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff',
+            'Content-Security-Policy': "default-src 'none'; connect-src 'self'; img-src 'self' data: blob:; "
+                                       "media-src 'self' blob:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; "
+                                       "base-uri 'none'; form-action 'none'; frame-ancestors 'none'"}
+
 @bp.before_request
 def gate():
     if M is None:
@@ -544,7 +981,7 @@ def gate():
     if request.method == 'POST' and p == '/app/enter':
         return None
     if not session_ok():
-        abort(404)                                   # बाहेरच्याला काहीच नाही — रिकामा 404
+        abort(404)
     if request.method == 'POST':
         if request.headers.get('X-Requested-With') != 'app':
             abort(404)
@@ -552,12 +989,6 @@ def gate():
         if o and o.split('://', 1)[-1] != request.host:
             abort(404)
     return None
-
-def _sec_headers():
-    return {'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff',
-            'Content-Security-Policy': "default-src 'none'; connect-src 'self'; img-src 'self' data: blob:; "
-                                       "media-src 'self' blob:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; "
-                                       "base-uri 'none'; form-action 'none'; frame-ancestors 'none'"}
 
 @bp.post('/enter')
 def enter():
@@ -574,7 +1005,7 @@ def enter():
             if secrets.compare_digest(t.encode(), tok.encode()):
                 hit = t
         if hit:
-            del TOKENS[hit]                          # एकदाच
+            del TOKENS[hit]
     if not hit:
         FAILS[k].append(now)
         time.sleep(1)
@@ -595,20 +1026,27 @@ def api(fn):
             return jsonify(error=f'{type(e).__name__}: {e}'[:200]), 500
     return w
 
-def _int(name, default=None):
+def _int(name, default=None, src=None):
+    v = (src if src is not None else request.values).get(name, default)
     try:
-        return int(request.values.get(name, default))
+        return int(v)
     except (TypeError, ValueError):
         raise ApiError(f'{name} चुकीचा')
 
-def _acc():
-    aid = request.values.get('acc') or (request.get_json(silent=True) or {}).get('acc')
-    if not aid or not re.fullmatch(r'a_[0-9a-f]{8}', aid):
+def _json():
+    return request.get_json(silent=True) or {}
+
+def _acc(d=None):
+    aid = (d or {}).get('acc') or request.values.get('acc')
+    if not aid or not re.fullmatch(r'a_[0-9a-f]{8}', str(aid)):
         raise ApiError('account निवडा')
     return aid
 
-def _json():
-    return request.get_json(silent=True) or {}
+def _ids(d, key='ids'):
+    v = d.get(key)
+    if not isinstance(v, list) or not v or len(v) > 100:
+        raise ApiError('ids चुकीचे')
+    return [int(x) for x in v]
 
 @bp.get('', strict_slashes=False)
 def ui():
@@ -618,18 +1056,66 @@ def ui():
 @api
 def api_state():
     return jsonify(accounts=M.accounts_view(), bw=bw_status(), default_api=bool(DEF_API_ID and DEF_API_HASH),
-                   max_upload=MAX_UPLOAD)
+                   chunk=CHUNK, seq=M.seq)
 
 @bp.get('/api/dialogs')
 @api
 def api_dialogs():
-    return jsonify(dialogs=M.call(M.a_dialogs(_acc())))
+    return jsonify(dialogs=M.call(M.a_dialogs(_acc(), request.args.get('archived') == '1')))
 
 @bp.get('/api/messages')
 @api
 def api_messages():
     lim = max(1, min(_int('limit', 30), 60))
-    return jsonify(messages=M.call(M.a_messages(_acc(), _int('chat'), _int('before', 0), lim)))
+    return jsonify(M.call(M.a_messages(_acc(), _int('chat'), _int('before', 0), lim)))
+
+@bp.get('/api/around')
+@api
+def api_around():
+    return jsonify(messages=M.call(M.a_around(_acc(), _int('chat'), _int('id'))))
+
+@bp.get('/api/search')
+@api
+def api_search():
+    q = request.args.get('q', '').strip()[:100]
+    if len(q) < 2:
+        raise ApiError('कमीत कमी 2 अक्षरं')
+    chat = request.args.get('chat')
+    return jsonify(messages=M.call(M.a_search(_acc(), q, int(chat) if chat else None)))
+
+@bp.get('/api/chatinfo')
+@api
+def api_chatinfo():
+    return jsonify(info=M.call(M.a_chatinfo(_acc(), _int('chat'))))
+
+@bp.get('/api/members')
+@api
+def api_members():
+    return jsonify(members=M.call(M.a_members(_acc(), _int('chat'), request.args.get('q', '')[:50])))
+
+@bp.get('/api/shared')
+@api
+def api_shared():
+    return jsonify(messages=M.call(M.a_shared(_acc(), _int('chat'), request.args.get('kind', ''), _int('before', 0))))
+
+@bp.get('/api/contacts')
+@api
+def api_contacts():
+    return jsonify(contacts=M.call(M.a_contacts(_acc())))
+
+@bp.get('/api/sessions')
+@api
+def api_sessions():
+    return jsonify(sessions=M.call(M.a_sessions(_acc())))
+
+@bp.post('/api/sessions/terminate')
+@api
+def api_terminate():
+    d = _json()
+    if not str(d.get('hash', '')).lstrip('-').isdigit():
+        raise ApiError('hash चुकीचा')
+    M.call(M.a_terminate(_acc(d), d['hash']))
+    return jsonify(ok=1)
 
 @bp.post('/api/send')
 @api
@@ -638,7 +1124,8 @@ def api_send():
     text = str(d.get('text', ''))
     if not text.strip() or len(text) > 4096:
         raise ApiError('text रिकामा किंवा 4096 पेक्षा मोठा')
-    return jsonify(message=M.call(M.a_send(_acc(), int(d['chat']), text, d.get('reply_to'))))
+    return jsonify(message=M.call(M.a_send(_acc(d), int(d['chat']), text, d.get('reply_to'), d.get('md'), d.get('silent'),
+                                           d.get('schedule'), d.get('preview', True))))
 
 @bp.post('/api/edit')
 @api
@@ -647,54 +1134,286 @@ def api_edit():
     text = str(d.get('text', ''))
     if not text.strip() or len(text) > 4096:
         raise ApiError('text रिकामा किंवा मोठा')
-    return jsonify(message=M.call(M.a_edit(_acc(), int(d['chat']), int(d['id']), text)))
+    return jsonify(message=M.call(M.a_edit(_acc(d), int(d['chat']), int(d['id']), text, d.get('md'))))
 
 @bp.post('/api/delete')
 @api
 def api_delete():
     d = _json()
-    M.call(M.a_delete(_acc(), int(d['chat']), int(d['id'])))
+    M.call(M.a_delete(_acc(d), int(d['chat']), _ids(d), d.get('revoke', True)))
     return jsonify(ok=1)
+
+@bp.post('/api/forward')
+@api
+def api_forward():
+    d = _json()
+    return jsonify(messages=M.call(M.a_forward(_acc(d), int(d['from_chat']), _ids(d), int(d['to_chat']), d.get('hide_author'))))
+
+@bp.post('/api/pin')
+@api
+def api_pin():
+    d = _json()
+    M.call(M.a_pin(_acc(d), int(d['chat']), int(d['id']), d.get('unpin')))
+    return jsonify(ok=1)
+
+@bp.post('/api/react')
+@api
+def api_react():
+    d = _json()
+    em = str(d.get('emoji') or '')[:8]
+    return jsonify(message=M.call(M.a_react(_acc(d), int(d['chat']), int(d['id']), em)))
+
+@bp.post('/api/vote')
+@api
+def api_vote():
+    d = _json()
+    return jsonify(message=M.call(M.a_vote(_acc(d), int(d['chat']), int(d['id']), [int(x) for x in d.get('options', [])][:10])))
+
+@bp.post('/api/click')
+@api
+def api_click():
+    d = _json()
+    return jsonify(M.call(M.a_click(_acc(d), int(d['chat']), int(d['id']), int(d['i']), int(d['j']))))
 
 @bp.post('/api/read')
 @api
 def api_read():
     d = _json()
-    M.call(M.a_read(_acc(), int(d['chat']), int(d.get('max_id', 0))))
+    M.call(M.a_read(_acc(d), int(d['chat']), int(d.get('max_id', 0))))
     return jsonify(ok=1)
 
-@bp.post('/api/upload')
+@bp.post('/api/typing')
 @api
-def api_upload():
-    if (request.content_length or 0) > MAX_UPLOAD + 65536:
-        raise ApiError(f'फाइल {MAX_UPLOAD // 1048576} MB पेक्षा मोठी आहे', 413)
-    f = request.files.get('file')
-    if not f:
-        raise ApiError('फाइल नाही')
-    data = f.read(MAX_UPLOAD + 1)
-    if len(data) > MAX_UPLOAD:
-        raise ApiError(f'फाइल {MAX_UPLOAD // 1048576} MB पेक्षा मोठी आहे', 413)
+def api_typing():
+    d = _json()
+    M.call(M.a_typing(_acc(d), int(d['chat'])))
+    return jsonify(ok=1)
+
+@bp.post('/api/chat/mute')
+@api
+def api_chat_mute():
+    d = _json()
+    M.call(M.a_mute(_acc(d), int(d['chat']), d.get('mute')))
+    return jsonify(ok=1)
+
+@bp.post('/api/chat/pin')
+@api
+def api_chat_pin():
+    d = _json()
+    M.call(M.a_chatpin(_acc(d), int(d['chat']), d.get('pin')))
+    return jsonify(ok=1)
+
+@bp.post('/api/chat/archive')
+@api
+def api_chat_archive():
+    d = _json()
+    M.call(M.a_archive(_acc(d), int(d['chat']), d.get('archive')))
+    return jsonify(ok=1)
+
+@bp.post('/api/chat/delete')
+@api
+def api_chat_delete():
+    d = _json()
+    M.call(M.a_chatdelete(_acc(d), int(d['chat'])))
+    return jsonify(ok=1)
+
+@bp.post('/api/resolve')
+@api
+def api_resolve():
+    d = _json()
+    return jsonify(dialog=M.call(M.a_resolve(_acc(d), str(d.get('q', '')))))
+
+@bp.post('/api/join')
+@api
+def api_join():
+    d = _json()
+    return jsonify(dialog=M.call(M.a_join(_acc(d), str(d.get('q', '')))))
+
+@bp.post('/api/me')
+@api
+def api_me():
+    d = _json()
+    M.call(M.a_setme(_acc(d), str(d.get('first', ''))[:64], str(d.get('last', ''))[:64], str(d.get('about', ''))[:140]))
+    return jsonify(ok=1)
+
+# --- images: avatar / thumb
+def _img(data, mime, days=7):
+    return Response(data, mimetype=mime, headers={'Cache-Control': f'private, max-age={days * 86400}',
+                                                  'X-Content-Type-Options': 'nosniff', 'Content-Security-Policy': "default-src 'none'; sandbox"})
+
+@bp.get('/api/avatar')
+@api
+def api_avatar():
+    data = M.call(M.a_avatar(_acc(), _int('chat')))
+    if not data:
+        return Response(status=204, headers={'Cache-Control': 'private, max-age=3600'})
+    return _img(data, 'image/jpeg')
+
+@bp.get('/api/thumb')
+@api
+def api_thumb():
+    data = M.call(M.a_thumb(_acc(), _int('chat'), _int('id')), 90)
+    mime = 'image/webp' if data[:4] == b'RIFF' else ('image/png' if data[:4] == b'\x89PNG' else 'image/jpeg')
+    return _img(data, mime, 1)
+
+# --- मोठी फाइल: streaming + Range
+INLINE_OK = {'image/jpeg', 'image/png', 'image/webp', 'image/gif', 'video/mp4', 'video/webm', 'audio/mpeg', 'audio/ogg',
+             'audio/mp4', 'audio/webm', 'audio/wav', 'audio/x-wav', 'audio/aac'}
+
+def parse_range(h, size):
+    if not h:
+        return 0, size - 1, False
+    m = re.fullmatch(r'bytes=(\d*)-(\d*)', h.strip())
+    if not m or (m.group(1) == '' and m.group(2) == ''):
+        return 0, size - 1, False
+    a, b = m.groups()
+    if a == '':
+        start, end = max(0, size - int(b)), size - 1
+    else:
+        start, end = int(a), (int(b) if b else size - 1)
+    if start >= size or start > end:
+        raise ApiError('range चुकीचा', 416)
+    return start, min(end, size - 1), True
+
+@bp.get('/api/file')
+@api
+def api_file():
+    aid, chat, mid = _acc(), _int('chat'), _int('id')
+    info = M.call(M.a_info(aid, chat, mid))
+    size = info['size']
+    if size <= 0:
+        raise ApiError('फाइल रिकामी आहे', 404)
+    if size > MAX_MEDIA:
+        raise ApiError(f'फाइल {MAX_MEDIA // MB} MB पेक्षा मोठी आहे', 413)
+    start, end, partial = parse_range(request.headers.get('Range'), size)
+    length = end - start + 1
     st = bw_status()
-    if st['used'] + len(data) > st['limit']:
-        raise ApiError('bandwidth मर्यादा संपली', 429)
-    name = re.sub(r'[^\w.\- ]', '_', f.filename or 'file')[:80]
-    return jsonify(message=M.call(M.a_upload(_acc(), _int('chat'), data, name, request.form.get('caption', '')[:1000]), 180))
+    if st['used'] + length > st['limit']:
+        raise ApiError('या महिन्याची bandwidth मर्यादा संपली — फक्त text चालतो', 429)
+    if not STREAMS.acquire(timeout=20):
+        raise ApiError('खूप downloads चालू आहेत — थोड्या वेळाने', 503)
+    try:
+        it = M.call(M.a_iter(aid, chat, mid, start - start % REQ, size))
+    except Exception:
+        STREAMS.release()
+        raise
 
-INLINE_OK = {'image/jpeg', 'image/png', 'image/webp', 'image/gif', 'video/mp4', 'audio/mpeg', 'audio/ogg'}
+    def gen():
+        skip, remaining = start % REQ, length
+        try:
+            while remaining > 0:
+                chunk = M.call(M.a_next(it), 120)
+                if not chunk:
+                    break
+                if skip:
+                    chunk, skip = chunk[skip:], 0
+                chunk = chunk[:remaining]
+                remaining -= len(chunk)
+                bw_add(len(chunk))
+                yield chunk
+        finally:
+            try:
+                M.call(M.a_close(it), 10)
+            except Exception:
+                pass
+            STREAMS.release()
 
-@bp.get('/api/media')
-@api
-def api_media():
-    thumb = request.args.get('thumb') == '1'
-    data, info = M.call(M.a_media(_acc(), _int('chat'), _int('id'), thumb, request.args.get('ok') == '1'), 180)
     mime = info['mime'] if info['mime'] in INLINE_OK else 'application/octet-stream'
-    if thumb or info['kind'] == 'photo':
-        mime = 'image/jpeg' if mime == 'application/octet-stream' else mime
-    disp = 'inline' if mime in INLINE_OK else 'attachment'
-    fname = re.sub(r'[^\w.\- ]', '_', info['name'] or f"file_{request.args.get('id')}")
-    return Response(data, mimetype=mime, headers={
-        'Content-Disposition': f"{disp}; filename*=UTF-8''{fname}", 'X-Content-Type-Options': 'nosniff',
-        'Cache-Control': 'private, max-age=86400', 'Content-Security-Policy': "default-src 'none'; sandbox"})
+    dl = request.args.get('dl') == '1'
+    disp = 'attachment' if dl or mime not in INLINE_OK else 'inline'
+    fname = urllib.parse.quote(re.sub(r'[\r\n"\\]', '_', info['name'] or f'file_{mid}'))
+    h = {'Content-Length': str(length), 'Accept-Ranges': 'bytes', 'Content-Disposition': f"{disp}; filename*=UTF-8''{fname}",
+         'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'private, max-age=3600',
+         'Content-Security-Policy': "default-src 'none'; sandbox", 'X-BW-Counted': '1'}
+    if partial:
+        h['Content-Range'] = f'bytes {start}-{end}/{size}'
+    return Response(gen(), status=206 if partial else 200, mimetype=mime, headers=h, direct_passthrough=True)
+
+# --- मोठ्या फाइलचा upload: 8 MB तुकडे → disk → Telegram
+@bp.post('/api/up/start')
+@api
+def api_up_start():
+    d = _json()
+    aid, chat = _acc(d), int(d['chat'])
+    size = int(d.get('size', 0))
+    name = re.sub(r'[^\w.\- ()\[\]]', '_', os.path.basename(str(d.get('name', 'file'))))[:120] or 'file'
+    if aid not in M.clients:
+        raise ApiError('हा account सध्या online नाही', 409)
+    lim = M.limit_for(aid)
+    if size <= 0:
+        raise ApiError('फाइल रिकामी आहे')
+    if size > lim:
+        raise ApiError(f'फाइल {lim // MB} MB पेक्षा मोठी आहे (या account ची Telegram मर्यादा)', 413)
+    st = bw_status()
+    if st['used'] + size > st['limit']:
+        raise ApiError('या महिन्याची bandwidth मर्यादा संपली', 429)
+    with UP_LOCK:
+        if sum(1 for u in UP.values() if u['state'] in ('receiving', 'sending')) >= 3:
+            raise ApiError('आधीचे upload पूर्ण होऊ द्या (एका वेळी 3)', 429)
+    os.makedirs(UPDIR, exist_ok=True)
+    if shutil.disk_usage(UPDIR).free < size * 1.05 + 200 * MB:
+        raise ApiError('server वर जागा कमी (disk) — लहान फाइल पाठवा', 507)
+    uid = secrets.token_hex(6)
+    folder = os.path.join(UPDIR, uid)
+    os.makedirs(folder)
+    with UP_LOCK:
+        UP[uid] = {'acc': aid, 'chat': chat, 'name': name, 'size': size, 'written': 0, 'sent': 0, 'path': os.path.join(folder, name),
+                   'caption': str(d.get('caption', ''))[:1000], 'reply_to': d.get('reply_to'), 'as_file': bool(d.get('as_file')),
+                   'silent': bool(d.get('silent')), 'schedule': d.get('schedule'), 'md': bool(d.get('md')), 'state': 'receiving', 'err': ''}
+    return jsonify(id=uid, chunk=CHUNK)
+
+def _up(uid):
+    with UP_LOCK:
+        up = UP.get(uid)
+    if not up:
+        raise ApiError('upload सापडला नाही', 404)
+    return up
+
+@bp.post('/api/up/chunk')
+@api
+def api_up_chunk():
+    up = _up(request.args.get('id', ''))
+    off = _int('off')
+    if up['state'] != 'receiving':
+        raise ApiError('upload आता चालू नाही', 409)
+    if off != up['written']:
+        return jsonify(error='offset जुळत नाही', written=up['written']), 409
+    data = request.get_data()
+    if not data or up['written'] + len(data) > up['size']:
+        raise ApiError('तुकडा चुकीचा')
+    with open(up['path'], 'ab') as f:
+        f.write(data)
+    up['written'] += len(data)
+    return jsonify(written=up['written'])
+
+@bp.post('/api/up/finish')
+@api
+def api_up_finish():
+    up_id = str(_json().get('id', ''))
+    up = _up(up_id)
+    if up['written'] != up['size']:
+        raise ApiError('फाइल पूर्ण आलेली नाही', 409)
+    up['state'] = 'sending'
+    M.up_tasks[up_id] = asyncio.run_coroutine_threadsafe(M.a_send_file(up_id), M.loop)
+    return jsonify(ok=1)
+
+@bp.post('/api/up/cancel')
+@api
+def api_up_cancel():
+    up_id = str(_json().get('id', ''))
+    up = _up(up_id)
+    fut = M.up_tasks.pop(up_id, None)
+    if fut:
+        fut.cancel()
+    up['state'] = 'canceled'
+    shutil.rmtree(os.path.dirname(up['path']), ignore_errors=True)
+    return jsonify(ok=1)
+
+@bp.get('/api/up/status')
+@api
+def api_up_status():
+    up = _up(request.args.get('id', ''))
+    return jsonify(state=up['state'], written=up['written'], sent=up['sent'], size=up['size'], err=up['err'], message=up.get('msg'))
 
 @bp.get('/api/events')
 @api
@@ -748,8 +1467,11 @@ def api_login_password():
 
 def count_bw(resp):
     try:
-        if request.path.startswith('/app') and resp.content_length:
-            bw_add(resp.content_length)
+        if request.path.startswith('/app'):
+            if resp.headers.pop('X-BW-Counted', None):
+                return resp                              # stream: तुकड्यांनुसार आधीच मोजलं
+            if resp.content_length:
+                bw_add(resp.content_length)
     except Exception:
         pass
     return resp
@@ -757,7 +1479,6 @@ def count_bw(resp):
 
 # ───────────────────────── init ─────────────────────────
 def init(app, db, notify):
-    """True = चालू. नाहीतर `reason` मध्ये कारण."""
     global M, reason
     if Fernet is None or TelegramClient is None:
         reason = 'telethon / cryptography packages नाहीत'
@@ -780,104 +1501,3 @@ def init(app, db, notify):
 def start():
     if M:
         M.start()
-
-
-ENTER_PAGE = r'''<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
-<title>…</title><body style="font:16px system-ui;background:#0f1115;color:#e6e8ee;padding:30px">⏳
-<script>
-const k=new URLSearchParams(location.search).get('k');history.replaceState(null,'','/app/');
-fetch('/app/enter',{method:'POST',headers:{'Content-Type':'application/json','X-Requested-With':'app'},body:JSON.stringify({k})})
- .then(r=>r.ok?location.replace('/app/'):document.body.textContent='✖ Link संपला किंवा आधीच वापरला').catch(()=>document.body.textContent='✖ error');
-</script>'''
-
-UI_PAGE = r'''<!doctype html><html lang="mr"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>Accounts</title>
-<style>
-:root{--bg:#0f1115;--card:#171a21;--fg:#e6e8ee;--mut:#8b93a7;--ac:#4f8cff;--bd:#2a2f3a;--out:#25427a;--in:#222733}
-*{box-sizing:border-box}html,body{height:100%;margin:0}body{background:var(--bg);color:var(--fg);font:14px system-ui,sans-serif}
-#app{display:flex;height:100%}#side{width:340px;border-right:1px solid var(--bd);display:flex;flex-direction:column;background:var(--card)}
-#main{flex:1;display:flex;flex-direction:column;min-width:0}.top{display:flex;gap:8px;align-items:center;padding:8px;border-bottom:1px solid var(--bd)}
-select,input,textarea,button{background:#0b0d11;color:var(--fg);border:1px solid var(--bd);border-radius:8px;padding:8px;font:inherit}
-button{cursor:pointer}button.p{background:var(--ac);border-color:var(--ac);color:#fff}button.g{background:none;border:none;padding:4px 6px;color:var(--mut)}
-#accsel{flex:1;min-width:0}#bw{padding:4px 10px;color:var(--mut);font-size:12px}#filter{margin:6px 8px}
-#dlgs{overflow:auto;flex:1}.d{display:flex;gap:10px;padding:10px;border-bottom:1px solid var(--bd);cursor:pointer}.d:hover,.d.on{background:#1d2230}
-.av{width:42px;height:42px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:700;flex:none}
-.dm{flex:1;min-width:0}.dn{display:flex;justify-content:space-between;gap:6px}.dn b,.dl{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.dl{color:var(--mut)}
-.u{background:var(--ac);color:#fff;border-radius:10px;padding:0 7px;font-size:12px}
-#msgs{flex:1;overflow:auto;padding:10px;display:flex;flex-direction:column;gap:6px}.m{max-width:min(78%,560px);padding:7px 10px;border-radius:12px;background:var(--in);align-self:flex-start;word-break:break-word}
-.m.out{background:var(--out);align-self:flex-end}.mt{white-space:pre-wrap}.mf{font-size:12px;color:#7fb0ff;margin-bottom:2px}.mr{font-size:12px;color:var(--mut);border-left:2px solid var(--ac);padding-left:6px;margin-bottom:3px}
-.mi{display:flex;gap:4px;justify-content:flex-end;align-items:center;font-size:11px;color:var(--mut);margin-top:3px}.m img{max-width:100%;border-radius:8px;display:block;margin:4px 0}
-#bar{padding:6px 10px;color:var(--mut);font-size:12px;border-top:1px solid var(--bd);display:none}.cmp{display:flex;gap:6px;padding:8px;border-top:1px solid var(--bd)}
-#txt{flex:1;resize:none;height:42px}#modal{position:fixed;inset:0;background:#000a;display:none;align-items:center;justify-content:center;padding:14px}
-#box{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:16px;width:min(420px,100%);display:flex;flex-direction:column;gap:8px}#err{color:#ff6b6b;min-height:1em}
-.empty{color:var(--mut);margin:auto}#back{display:none}
-@media(max-width:700px){#side{width:100%}#main{display:none}.chat #side{display:none}.chat #main{display:flex}#back{display:inline-block}}
-</style></head><body>
-<div id="app"><aside id="side"><div class="top"><select id="accsel"></select><button id="add" title="Account जोडा">＋</button></div>
-<div id="bw"></div><input id="filter" placeholder="शोधा…"><div id="dlgs"></div></aside>
-<main id="main"><div class="top"><button id="back" class="g">←</button><b id="ct">चॅट निवडा</b></div>
-<div id="msgs"><div class="empty">डावीकडून चॅट निवडा</div></div><div id="bar"></div>
-<div class="cmp"><label class="g" style="cursor:pointer;align-self:center">📎<input id="file" type="file" hidden></label>
-<textarea id="txt" placeholder="message…"></textarea><button id="send" class="p">➤</button></div></main></div>
-<div id="modal"><div id="box"><b>Telegram account जोडा</b><div id="step"></div><div id="err"></div></div></div>
-<script>
-const $=s=>document.querySelector(s);let ST={accounts:[],default_api:false},acc=null,chat=null,seq=0,DL=[],MS=[],reply=null,editing=null,oldest=0;
-function el(t,p,...k){const e=document.createElement(t);for(const[a,v]of Object.entries(p||{})){if(a==='on')for(const[ev,f]of Object.entries(v))e.addEventListener(ev,f);else if(a==='text')e.textContent=v;else e.setAttribute(a,v)}k.flat().forEach(c=>c&&e.append(c));return e}
-async function api(path,body,form){const o=body===undefined&&!form?{}:{method:'POST',headers:form?{'X-Requested-With':'app'}:{'Content-Type':'application/json','X-Requested-With':'app'},body:form||JSON.stringify(body)};
- const r=await fetch(path,o);let d={};try{d=await r.json()}catch(e){}if(!r.ok)throw new Error(d.error||('error '+r.status));return d}
-const Q=o=>new URLSearchParams(o).toString(),col=n=>`hsl(${[...n].reduce((a,c)=>a+c.charCodeAt(0),0)%360} 45% 38%)`;
-const tm=t=>t?new Date(t*1e3).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}):'';
-const sz=n=>n>1048576?(n/1048576).toFixed(1)+' MB':Math.max(1,Math.round(n/1024))+' KB';
-async function loadState(){ST=await api('/app/api/state');const s=$('#accsel');s.replaceChildren(...ST.accounts.map(a=>el('option',{value:a.id,text:`${a.label||a.name} — ${a.state}`})));
- if(!acc&&ST.accounts.length)acc=ST.accounts[0].id;if(acc)s.value=acc;$('#bw').textContent=`📊 ${(ST.bw.used/1048576).toFixed(1)} MB / ${(ST.bw.limit/1073741824).toFixed(1)} GB (${ST.bw.month})`}
-async function loadDialogs(){if(!acc)return;try{DL=(await api('/app/api/dialogs?'+Q({acc}))).dialogs;drawDialogs()}catch(e){$('#dlgs').replaceChildren(el('div',{class:'empty',text:e.message}))}}
-function drawDialogs(){const f=$('#filter').value.toLowerCase();$('#dlgs').replaceChildren(...DL.filter(d=>d.name.toLowerCase().includes(f)).map(d=>
- el('div',{class:'d'+(d.id===chat?' on':''),on:{click:()=>openChat(d)}},el('div',{class:'av',style:'background:'+col(d.name),text:(d.name||'?').trim().slice(0,1).toUpperCase()}),
- el('div',{class:'dm'},el('div',{class:'dn'},el('b',{text:(d.pinned?'📌 ':'')+d.name}),el('span',{class:'dl',text:tm(d.ts)})),
- el('div',{class:'dn'},el('span',{class:'dl',text:(d.out?'✓ ':'')+d.last}),d.unread?el('span',{class:'u',text:d.unread}):null)))))}
-async function openChat(d){chat=d.id;$('#ct').textContent=d.name;document.body.classList.add('chat');setReply(null);MS=[];oldest=0;drawDialogs();
- try{MS=(await api('/app/api/messages?'+Q({acc,chat,limit:30}))).messages}catch(e){MS=[]}drawMsgs(true);markRead()}
-async function older(){if(!MS.length)return;const r=(await api('/app/api/messages?'+Q({acc,chat,before:MS[0].id,limit:30}))).messages;MS=r.concat(MS);drawMsgs(false)}
-function markRead(){if(MS.length)api('/app/api/read',{acc,chat,max_id:MS[MS.length-1].id}).catch(()=>{})}
-function mediaEl(m){const x=m.media;if(!x)return null;const u='/app/api/media?'+Q({acc,chat,id:m.id});
- if(x.kind==='photo'){const b=el('button',{class:'g',text:`📷 फोटो ${sz(x.size)} — लोड करा`});b.onclick=()=>{b.replaceWith(el('img',{src:u+'&ok=1'}))};return b}
- return el('a',{href:u+'&ok=1',target:'_blank',rel:'noopener',style:'color:#7fb0ff',text:`📎 ${x.name||x.kind} (${sz(x.size)}) — उघडा`})}
-function drawMsgs(bottom){const box=$('#msgs'),keep=box.scrollHeight-box.scrollTop;const kids=[];if(MS.length)kids.push(el('button',{class:'g',text:'↑ जुने messages',on:{click:older}}));
- for(const m of MS){const r=m.reply?el('div',{class:'mr',text:'↩ '+((MS.find(x=>x.id===m.reply)||{}).text||'#'+m.reply).slice(0,60)}):null;
-  kids.push(el('div',{class:'m'+(m.out?' out':'')},m.from&&!m.out?el('div',{class:'mf',text:m.from}):null,r,m.text?el('div',{class:'mt',text:m.text}):null,mediaEl(m),
-   el('div',{class:'mi'},el('span',{text:(m.edited?'edited · ':'')+tm(m.ts)}),el('button',{class:'g',text:'↩',on:{click:()=>setReply(m)}}),
-   m.out?el('button',{class:'g',text:'✎',on:{click:()=>startEdit(m)}}):null,el('button',{class:'g',text:'🗑',on:{click:()=>del(m)}}))))}
- box.replaceChildren(...(kids.length?kids:[el('div',{class:'empty',text:'message नाहीत'})]));box.scrollTop=bottom?box.scrollHeight:box.scrollHeight-keep}
-function setReply(m){reply=m;editing=null;const b=$('#bar');b.style.display=m?'block':'none';b.textContent=m?'↩ '+(m.text||'media').slice(0,80)+'  (रद्द: Esc)':''}
-function startEdit(m){editing=m;reply=null;$('#txt').value=m.text;const b=$('#bar');b.style.display='block';b.textContent='✎ edit करत आहात (रद्द: Esc)';$('#txt').focus()}
-async function del(m){if(!confirm('हा message delete करायचा?'))return;try{await api('/app/api/delete',{acc,chat,id:m.id});MS=MS.filter(x=>x.id!==m.id);drawMsgs(false)}catch(e){alert(e.message)}}
-async function send(){const t=$('#txt').value;if(!t.trim()||!chat)return;$('#txt').value='';try{if(editing){const r=await api('/app/api/edit',{acc,chat,id:editing.id,text:t});MS=MS.map(x=>x.id===r.message.id?r.message:x);setReply(null);editing=null}
- else{const r=await api('/app/api/send',{acc,chat,text:t,reply_to:reply&&reply.id});if(!MS.some(x=>x.id===r.message.id))MS.push(r.message);setReply(null)}drawMsgs(true)}catch(e){alert(e.message);$('#txt').value=t}}
-$('#send').onclick=send;$('#txt').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey&&innerWidth>700){e.preventDefault();send()}if(e.key==='Escape'){setReply(null);editing=null;$('#txt').value=''}});
-$('#file').onchange=async e=>{const f=e.target.files[0];e.target.value='';if(!f||!chat)return;if(f.size>ST.max_upload){alert('फाइल मोठी आहे (मर्यादा '+Math.floor(ST.max_upload/1048576)+' MB)');return}
- if(!confirm(`"${f.name}" (${sz(f.size)}) पाठवायची? bandwidth खर्च होतो.`))return;const fd=new FormData();fd.append('file',f);fd.append('acc',acc);fd.append('chat',chat);
- try{const r=await api('/app/api/upload',undefined,fd);MS.push(r.message);drawMsgs(true)}catch(err){alert(err.message)}};
-$('#accsel').onchange=e=>{acc=e.target.value;chat=null;MS=[];$('#ct').textContent='चॅट निवडा';$('#msgs').replaceChildren(el('div',{class:'empty',text:'चॅट निवडा'}));loadDialogs()};
-$('#filter').oninput=drawDialogs;$('#back').onclick=()=>document.body.classList.remove('chat');
-let dt=null;function soon(){clearTimeout(dt);dt=setTimeout(()=>{loadDialogs();loadState().catch(()=>{})},600)}
-async function poll(){for(;;){try{const r=await api('/app/api/events?'+Q({since:seq,wait:20}));seq=r.seq;
- for(const e of r.events){if(e.acc!==acc)continue;soon();if(e.chat===chat){if(e.type==='new'&&e.msg&&!MS.some(x=>x.id===e.msg.id)){MS.push(e.msg);markRead()}
-  else if(e.type==='edit'&&e.msg)MS=MS.map(x=>x.id===e.msg.id?e.msg:x);else if(e.type==='del')MS=MS.filter(x=>!(e.ids||[]).includes(x.id));drawMsgs(e.type==='new')}}}catch(e){await new Promise(r=>setTimeout(r,4000))}}}
-const modal=$('#modal'),step=$('#step'),err=$('#err');let LID=null;
-function say(t){err.textContent=t||''}
-function stepStart(){say();step.replaceChildren(el('input',{id:'l_label',placeholder:'नाव (उदा. Office)'}),el('input',{id:'l_phone',placeholder:'+919876543210',inputmode:'tel'}),
- el('label',{},el('input',{type:'radio',name:'api',value:'default',id:'l_def'}),' Default API (server env)'),el('label',{},el('input',{type:'radio',name:'api',value:'custom'}),' वेगळा api_id / api_hash'),
- el('input',{id:'l_aid',placeholder:'api_id',style:'display:none'}),el('input',{id:'l_ahash',placeholder:'api_hash',style:'display:none'}),
- el('div',{style:'display:flex;gap:8px'},el('button',{class:'p',text:'कोड पाठवा',on:{click:start}}),el('button',{text:'रद्द',on:{click:()=>modal.style.display='none'}})));
- const d=$('#l_def');d.disabled=!ST.default_api;(ST.default_api?d:document.querySelector('input[value=custom]')).checked=true;
- document.querySelectorAll('input[name=api]').forEach(r=>r.onchange=()=>{const c=document.querySelector('input[name=api]:checked').value==='custom';$('#l_aid').style.display=$('#l_ahash').style.display=c?'block':'none'});
- if(!ST.default_api){$('#l_aid').style.display=$('#l_ahash').style.display='block'}}
-async function start(){say('…');try{const r=await api('/app/api/login/start',{label:$('#l_label').value,phone:$('#l_phone').value,api:document.querySelector('input[name=api]:checked').value,api_id:$('#l_aid').value,api_hash:$('#l_ahash').value});LID=r.login_id;say();
- step.replaceChildren(el('div',{text:'Telegram app मध्ये आलेला कोड टाका:',style:'color:var(--mut)'}),el('input',{id:'l_code',placeholder:'12345',inputmode:'numeric',autocomplete:'off'}),el('button',{class:'p',text:'Login',on:{click:code}}))}catch(e){say(e.message)}}
-async function code(){say('…');try{const r=await api('/app/api/login/code',{login_id:LID,code:$('#l_code').value});if(r.next==='password'){say();
- step.replaceChildren(el('div',{text:'2-step verification password:',style:'color:var(--mut)'}),el('input',{id:'l_pw',type:'password',autocomplete:'off'}),el('button',{class:'p',text:'Login',on:{click:pw}}))}else done(r)}catch(e){say(e.message)}}
-async function pw(){say('…');try{done(await api('/app/api/login/password',{login_id:LID,password:$('#l_pw').value}))}catch(e){say(e.message)}}
-async function done(r){modal.style.display='none';acc=r.account;await loadState();loadDialogs()}
-$('#add').onclick=()=>{stepStart();modal.style.display='flex'};
-(async()=>{try{await loadState();await loadDialogs()}catch(e){document.body.textContent='✖ '+e.message}poll();setInterval(()=>loadState().catch(()=>{}),60000)})();
-</script></body></html>'''

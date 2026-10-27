@@ -643,7 +643,7 @@ app.config.update(SESSION_COOKIE_SECURE=os.environ.get('COOKIE_SECURE', '1') == 
                   SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Strict')
 TG_ON = bool(tgweb and tgweb.init(app, MONGO_DB[0], lambda t: notify(t)))
 if tgweb and TG_ON:
-    app.config['MAX_CONTENT_LENGTH'] = tgweb.MAX_UPLOAD + 2 * 1024 * 1024
+    app.config['MAX_CONTENT_LENGTH'] = tgweb.CHUNK + 4 * 1024 * 1024        # upload 8 MB तुकड्यांत येतो
 elif tgweb:
     print(f'ℹ️ Telegram accounts बंद: {tgweb.reason}')
 
