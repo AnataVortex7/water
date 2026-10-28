@@ -1,5 +1,7 @@
-flask>=3.0
-gunicorn>=22.0
+flask>=3.0.0
+waitress>=3.0.0
+pyrofork>=2.3.0
+TgCrypto>=1.2.5
 pymongo>=4.7
 telethon>=1.36
 cryptography>=42

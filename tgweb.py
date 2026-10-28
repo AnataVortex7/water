@@ -42,6 +42,8 @@ LEASE_SECS = 45
 CHUNK = 8 * MB                                              # browser → server upload तुकडा
 REQ = 512 * 1024                                            # server ← Telegram download तुकडा
 UPDIR = os.path.join(tempfile.gettempdir(), 'tgup')
+CACHE_DIR = os.path.join(tempfile.gettempdir(), 'tgcache')                    # Telegram → server disk (अर्धवट = .part)
+DISK_CACHE = int(float(os.environ.get('DISK_CACHE_GB', '10')) * 1024 ** 3)    # cache ची कमाल जागा (जुन्या फाइल आपोआप हटतात)
 
 M = None
 reason = ''
@@ -50,6 +52,7 @@ FAILS = collections.defaultdict(list)
 BW = {'month': '', 'bytes': 0, 'dirty': False}
 BW_LOCK = threading.Lock()
 UP, UP_LOCK = {}, threading.Lock()
+DL, DL_LOCK = {}, threading.Lock()          # चालू/झालेले server-download jobs
 STREAMS = threading.Semaphore(3)
 _F = [None]
 
@@ -270,6 +273,57 @@ def _lru_put(od, key, val, cap_items=300, cap_bytes=16 * MB):
         total -= len(v or b'')
 
 
+def _ckey(aid, chat, mid):
+    return f'{aid}_{chat}_{mid}'.replace('-', 'm')
+
+def _cpath(key):
+    return os.path.join(CACHE_DIR, key)
+
+def cache_files():
+    """(complete फाइल्स, .part चा एकूण आकार)."""
+    done, part = [], 0
+    try:
+        for f in os.listdir(CACHE_DIR):
+            p = os.path.join(CACHE_DIR, f)
+            if not os.path.isfile(p):
+                continue
+            if f.endswith('.part'):
+                part += os.path.getsize(p)
+            else:
+                done.append((os.path.getmtime(p), os.path.getsize(p), p))
+    except FileNotFoundError:
+        pass
+    return done, part
+
+def cache_usage():
+    done, part = cache_files()
+    return sum(s for _, s, _ in done) + part, len(done)
+
+def cache_evict(need=0):
+    """जागा कमी पडली तर सर्वात जुन्या (कमी वापरलेल्या) फाइल्स आधी हटवतो."""
+    done, part = cache_files()
+    total = sum(s for _, s, _ in done) + part
+    for _, s, p in sorted(done):
+        if total + need <= DISK_CACHE:
+            break
+        try:
+            os.remove(p)
+            total -= s
+        except OSError:
+            pass
+
+def cache_cleanup():
+    cache_evict(0)
+    try:
+        now = time.time()
+        for f in os.listdir(CACHE_DIR):
+            p = os.path.join(CACHE_DIR, f)
+            if f.endswith('.part') and now - os.path.getmtime(p) > 24 * 3600:
+                os.remove(p)
+    except FileNotFoundError:
+        pass
+
+
 # ───────────────────────── Manager ─────────────────────────
 class Manager:
     def __init__(self, db, notify):
@@ -287,6 +341,7 @@ class Manager:
         self.instance = uuid.uuid4().hex[:8]
         self.avatars, self.thumbs = collections.OrderedDict(), collections.OrderedDict()
         self.up_tasks = {}
+        self.dl_tasks = {}
 
     # --- thread / loop
     def start(self):
@@ -357,6 +412,10 @@ class Manager:
             pass
         except Exception as e:
             print('upload cleanup:', e)
+        try:
+            cache_cleanup()
+        except Exception as e:
+            print('cache cleanup:', e)
 
     # --- supervisor
     async def supervisor(self):
@@ -782,6 +841,55 @@ class Manager:
                     await r
         except Exception:
             pass
+
+    # --- मोठी फाइल Telegram → server disk (background, progress, अर्धवट असेल तर पुढे चालू)
+    async def a_download(self, key):
+        with DL_LOCK:
+            j = DL.get(key)
+        if not j:
+            return
+        final = _cpath(key)
+        part = final + '.part'
+        def ev(state, **kw):
+            self.push(j['acc'], 'dl', j['chat'], None, None, mid=j['id'], state=state, done=j['done'], total=j['size'], **kw)
+        try:
+            cl = self._cl(j['acc'])
+            m = await cl.get_messages(j['chat'], ids=j['id'])
+            if not m or not getattr(m, 'media', None):
+                raise ApiError('media सापडला नाही', 404)
+            size, done = j['size'], 0
+            if os.path.exists(part):
+                n = os.path.getsize(part)
+                done = n - n % REQ                       # REQ च्या पटीत → Telegram ला चालतो
+            with open(part, 'r+b' if os.path.exists(part) else 'wb') as f:
+                f.truncate(done)
+                f.seek(done)
+                j['done'] = done
+                last = 0.0
+                async for chunk in cl.iter_download(m.media, offset=done, chunk_size=REQ, request_size=REQ, file_size=size):
+                    f.write(chunk)
+                    done += len(chunk)
+                    j['done'] = done
+                    if time.time() - last > 0.7:
+                        last = time.time()
+                        ev('downloading')
+                    if j.get('cancel'):
+                        raise asyncio.CancelledError()
+            if done < size:
+                raise IOError(f'अपूर्ण download ({done}/{size})')
+            os.replace(part, final)
+            j.update(state='cached', done=size)
+            ev('cached')
+            await asyncio.get_running_loop().run_in_executor(None, cache_evict, 0)
+        except asyncio.CancelledError:
+            j['state'] = 'none'
+            ev('none')
+            raise
+        except Exception as e:
+            j.update(state='error', err=f'{e}'[:140])
+            ev('error', err=j['err'])
+        finally:
+            self.dl_tasks.pop(key, None)
 
     # --- मोठ्या फाइलचा upload (disk वरून Telegram ला, progress सकट)
     async def a_send_file(self, up_id):
@@ -1275,6 +1383,19 @@ def parse_range(h, size):
         raise ApiError('range चुकीचा', 416)
     return start, min(end, size - 1), True
 
+def _file_headers(info, mid, start, end, size, partial):
+    length = end - start + 1
+    mime = info['mime'] if info['mime'] in INLINE_OK else 'application/octet-stream'
+    dl = request.args.get('dl') == '1'
+    disp = 'attachment' if dl or mime not in INLINE_OK else 'inline'
+    fname = urllib.parse.quote(re.sub(r'[\r\n"\\]', '_', info['name'] or f'file_{mid}'))
+    h = {'Content-Length': str(length), 'Accept-Ranges': 'bytes', 'Content-Disposition': f"{disp}; filename*=UTF-8''{fname}",
+         'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'private, max-age=3600',
+         'Content-Security-Policy': "default-src 'none'; sandbox", 'X-BW-Counted': '1'}
+    if partial:
+        h['Content-Range'] = f'bytes {start}-{end}/{size}'
+    return mime, h
+
 @bp.get('/api/file')
 @api
 def api_file():
@@ -1290,6 +1411,25 @@ def api_file():
     st = bw_status()
     if st['used'] + length > st['limit']:
         raise ApiError('या महिन्याची bandwidth मर्यादा संपली — फक्त text चालतो', 429)
+    mime, h = _file_headers(info, mid, start, end, size, partial)
+    cp = _cpath(_ckey(aid, chat, mid))
+    if os.path.isfile(cp) and os.path.getsize(cp) == size:           # server च्या disk वर आधीच आहे → Telegram ला विचारायचं नाही
+        try:
+            os.utime(cp)                                                # LRU: नुकतीच वापरली
+        except OSError:
+            pass
+        def gen_disk():
+            remaining = length
+            with open(cp, 'rb') as f:
+                f.seek(start)
+                while remaining > 0:
+                    chunk = f.read(min(256 * 1024, remaining))
+                    if not chunk:
+                        break
+                    remaining -= len(chunk)
+                    bw_add(len(chunk))
+                    yield chunk
+        return Response(gen_disk(), status=206 if partial else 200, mimetype=mime, headers=h, direct_passthrough=True)
     if not STREAMS.acquire(timeout=20):
         raise ApiError('खूप downloads चालू आहेत — थोड्या वेळाने', 503)
     try:
@@ -1318,16 +1458,80 @@ def api_file():
                 pass
             STREAMS.release()
 
-    mime = info['mime'] if info['mime'] in INLINE_OK else 'application/octet-stream'
-    dl = request.args.get('dl') == '1'
-    disp = 'attachment' if dl or mime not in INLINE_OK else 'inline'
-    fname = urllib.parse.quote(re.sub(r'[\r\n"\\]', '_', info['name'] or f'file_{mid}'))
-    h = {'Content-Length': str(length), 'Accept-Ranges': 'bytes', 'Content-Disposition': f"{disp}; filename*=UTF-8''{fname}",
-         'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'private, max-age=3600',
-         'Content-Security-Policy': "default-src 'none'; sandbox", 'X-BW-Counted': '1'}
-    if partial:
-        h['Content-Range'] = f'bytes {start}-{end}/{size}'
     return Response(gen(), status=206 if partial else 200, mimetype=mime, headers=h, direct_passthrough=True)
+
+# --- Server disk cache: Telegram → server (background), मग तिथून
+def _dl_state(aid, chat, mid):
+    key = _ckey(aid, chat, mid)
+    if os.path.isfile(_cpath(key)):
+        return {'state': 'cached', 'done': os.path.getsize(_cpath(key)), 'size': os.path.getsize(_cpath(key))}
+    with DL_LOCK:
+        j = DL.get(key)
+    if j and j['state'] in ('downloading', 'error'):
+        return {'state': j['state'], 'done': j['done'], 'size': j['size'], 'err': j.get('err', '')}
+    return {'state': 'none', 'done': 0, 'size': 0}
+
+@bp.post('/api/dl/start')
+@api
+def api_dl_start():
+    d = _json()
+    aid, chat, mid = _acc(d), int(d['chat']), int(d['id'])
+    cur = _dl_state(aid, chat, mid)
+    if cur['state'] in ('cached', 'downloading'):
+        return jsonify(cur)
+    info = M.call(M.a_info(aid, chat, mid))
+    size = info['size']
+    if size <= 0:
+        raise ApiError('फाइल रिकामी आहे', 404)
+    if size > DISK_CACHE:
+        raise ApiError(f'फाइल server cache (DISK_CACHE_GB = {DISK_CACHE // MB} MB) पेक्षा मोठी आहे — थेट stream करा', 413)
+    with DL_LOCK:
+        if sum(1 for j in DL.values() if j['state'] == 'downloading') >= 2:
+            raise ApiError('आधीचे 2 downloads पूर्ण होऊ द्या', 429)
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    cache_evict(size)                                                   # जागा करतो (जुन्या फाइल हटवून)
+    if shutil.disk_usage(CACHE_DIR).free < size * 1.02 + 300 * MB:
+        raise ApiError('server वर disk जागा कमी — cache साफ करा किंवा थेट stream करा', 507)
+    key = _ckey(aid, chat, mid)
+    with DL_LOCK:
+        DL[key] = {'acc': aid, 'chat': chat, 'id': mid, 'size': size, 'done': 0, 'state': 'downloading', 'err': ''}
+    M.dl_tasks[key] = asyncio.run_coroutine_threadsafe(M.a_download(key), M.loop)
+    return jsonify(state='downloading', done=0, size=size)
+
+@bp.post('/api/dl/cancel')
+@api
+def api_dl_cancel():
+    d = _json()
+    key = _ckey(_acc(d), int(d['chat']), int(d['id']))
+    with DL_LOCK:
+        j = DL.get(key)
+    if j:
+        j['cancel'] = True
+    return jsonify(ok=1)
+
+@bp.get('/api/dl/status')
+@api
+def api_dl_status():
+    aid, chat = _acc(), _int('chat')
+    ids = [int(x) for x in request.args.get('ids', '').split(',') if x.strip().isdigit()][:60]
+    return jsonify(items={str(i): _dl_state(aid, chat, i) for i in ids})
+
+@bp.get('/api/cache')
+@api
+def api_cache():
+    used, n = cache_usage()
+    return jsonify(used=used, limit=DISK_CACHE, files=n)
+
+@bp.post('/api/cache/clear')
+@api
+def api_cache_clear():
+    done, _ = cache_files()
+    for _, _, p in done:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+    return jsonify(ok=1, removed=len(done))
 
 # --- मोठ्या फाइलचा upload: 8 MB तुकडे → disk → Telegram
 @bp.post('/api/up/start')

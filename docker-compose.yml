@@ -1,0 +1,25 @@
+version: "3.9"
+services:
+  hub:
+    build: .
+    restart: unless-stopped
+    ports: ["8080:8080"]
+    volumes: ["hub_data:/data"]
+    environment:
+      BOT_TOKEN: "123:ABC"                 # ONE bot for everything (TELEGRAM_BOT_TOKEN also works)
+      BOT_NAME: "YourBotUsername"          # without @
+      API_ID: "YOUR_API_ID"                # my.telegram.org  (TG_API_ID also works)
+      API_HASH: "YOUR_API_HASH"
+      WEB_URL: "https://YOUR_APP.koyeb.app"
+      WEB_PASSWORD: "ChangeMe-Long-Web-Password"        # Backup Browser website password
+      ADMIN_PASSWORD: "ChangeMe-Long-Admin-Password"    # bot login password (min 10 chars)
+      ADMIN_TOTP_SECRET: ""                # 2FA secret (strongly recommended)
+      COLAB_SECRET: "change-me"
+      PANEL_PASSWORD: "change-me"
+      SECRET_KEY: "CHANGE_THIS_RANDOM_64_CHARS"
+      SESSION_KEY: ""                      # Fernet key for Telegram-account sessions
+      MONGO_URI: ""                        # Atlas URI (MONGODB_URI also works)
+      BACKUP_GROUP_ID: "-100XXXXXXXXXX"
+      OWNER_CHAT_ID: "1193564058"
+volumes:
+  hub_data:

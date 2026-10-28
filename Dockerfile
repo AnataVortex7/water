@@ -1,8 +1,18 @@
-FROM python:3.12-slim
+FROM python:3.11-slim
+
 WORKDIR /app
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+
 COPY . .
+
+# Persistent data volume (Backup Browser index / cache)
+VOLUME ["/data"]
+RUN mkdir -p /tmp/tg_dl
+
 ENV PYTHONUNBUFFERED=1
-# 1 worker: PC यादी + bot state memory मध्ये आहे. 32 threads: दर PC एक long-poll connection धरतो.
-CMD ["sh", "-c", "gunicorn -b 0.0.0.0:${PORT:-10000} -w 1 --threads 32 --timeout 90 app:app"]
+EXPOSE 8080
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s CMD python -c "import urllib.request;urllib.request.urlopen('http://127.0.0.1:'+__import__('os').environ.get('PORT','8080')+'/healthz',timeout=4)" || exit 1
+
+CMD ["python", "app.py"]
